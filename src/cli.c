@@ -204,10 +204,6 @@ main(int argc, char *argv[])
 		printf("\tTotal time: %lf\n", elapsed);
 		printf("\tPrep time: %lf\n", stats->prep_time);
 		printf("\tIO time: %lf\n", stats->io_time);
-		if (opts.data_dir[0] == '\0') {
-			printf("\t -- SYNTHETIC NUMBERS EXCLUDING PREP TIME -- \n");
-			time = stats->io_time;
-		}
 		printf("\tFile/s: %lf\n", (args.batches * opts.batch_size) / elapsed);
 		printf("\tMiB/s: %lf\n", (stats->bytes / 1024.f / 1024.f) / elapsed);
 		printf("\tIOPS: %lf\n", stats->io / elapsed);
