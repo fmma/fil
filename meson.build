@@ -32,11 +32,17 @@ xal_dep = dependency(
   required: true
 )
 
+opends_aisio_dep = dependency(
+  'opends_aisio',
+  required: true
+)
+
 fil_deps = [
   rt_dep,
   cuda_dep,
   xnvme_dep,
   xal_dep,
+  opends_aisio_dep,
 ]
 
 public_headers = files(
@@ -46,6 +52,7 @@ public_headers = files(
 sources = files(
   'src/iter.c',
   'src/io.c',
+  'src/opends.c',
 )
 
 include_dirs = include_directories('include')

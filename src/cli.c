@@ -23,9 +23,11 @@ print_help(const char *name)
 	fprintf(stderr, "\t \t \t | \t The data-dir should be a name of a directory, not a path\n");
 	fprintf(stderr, "\t \t \t | \t The name of the data-dir should be unique\n");
 	fprintf(stderr, "\t --backend \t | \t The backend to use for reading files (aisio-cpu "
-			"[default], aisio-gpu, posix, gds)\n");
+			"[default], aisio-gpu, posix, gds, opends)\n");
 	fprintf(stderr, "\t --mnt \t \t | \t The mountpoint of the drive (default = /mnt). Only "
 			"relevant for backends: 'posix' and 'gds'\n");
+	fprintf(stderr, "\t --opends-fs-mock-path | \t Path to OpenDS fs_mock backing file (.bin). "
+			"Required for backend: 'opends'\n");
 	fprintf(stderr, "\t --iosize \t | \t The number of bytes per I/O (default = 4096). Only relevant for backends: 'aisio-cpu' and 'aisio-gpu'\n");
 	fprintf(stderr, "\t --gpu-nqueues \t | \t The number of GPU queues to create (default = "
 			"128). Only relevant for backend: 'aisio-gpu'\n");
@@ -56,6 +58,8 @@ parse_args(int argc, char *argv[], struct fil_cli_args *args, struct fil_opts *o
 			opts->mnt = argv[++i];
 		} else if (strcmp(argv[i], "--backend") == 0) {
 			opts->backend = argv[++i];
+		} else if (strcmp(argv[i], "--opends-fs-mock-path") == 0) {
+			opts->opends_fs_mock_path = argv[++i];
 		} else if (strcmp(argv[i], "--iosize") == 0) {
 			opts->iosize = strtoul(argv[++i], (char **)NULL, 10);
 			if (opts->iosize == 0) {

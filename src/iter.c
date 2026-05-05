@@ -9,6 +9,8 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <ds_file.h>
+#include <fs_mock.h>
 #include <libxal.h>
 #include <libxnvme.h>
 
@@ -64,6 +66,12 @@ _xnvme_setup(struct fil_iter *iter, struct fil_dev *device, const char *uri)
 			fprintf(stderr, "Could not open cuFile driver: %d\n", status.err);
 			return status.err;
 		}
+	} else if (strcmp(backend, "opends") == 0) {
+		/* OpenDS aisio owns the xNVMe device internally. Skip
+		 * fil's xnvme/XAL bring-up and let _opends_setup drive
+		 * dataset enumeration via the fs_mock extent cache. */
+		iter->type = FIL_OPENDS;
+		return 0;
 	} else {
 		fprintf(stderr, "Invalid backend: %s\n", backend);
 		return EINVAL;
@@ -154,6 +162,75 @@ _find_prefix(struct fil_iter *iter)
 	}
 }
 
+/* Drive the aisio backend's mock filesystem layer in lieu of the XAL
+ * walk we'd do for a kernel-mounted FS. fs_mock_init parses the extent
+ * cache produced by OpenDS's tools/cache_extents; the path table doubles
+ * as the dataset enumeration.
+ *
+ * Also opens the OpenDS driver and the underlying xNVMe device (via a
+ * scratch handle on mock_fh 0) so the subsequent ds_file_alloc calls
+ * have a backing xnvme_dev. The scratch handle is deregistered before
+ * returning; xNVMe stays open for the iterator's lifetime. */
+static int
+_opends_setup(struct fil_iter *iter)
+{
+	int err;
+	uint32_t n_files;
+	uint64_t size;
+	ds_file_error_t derr;
+	ds_file_handle_t scratch;
+
+	if (!iter->opts->opends_fs_mock_path || iter->opts->opends_fs_mock_path[0] == '\0') {
+		fprintf(stderr, "opends backend requires --opends-fs-mock-path\n");
+		return EINVAL;
+	}
+
+	err = -fs_mock_init(iter->opts->opends_fs_mock_path);
+	if (err) {
+		fprintf(stderr, "fs_mock_init(%s): %d\n",
+			iter->opts->opends_fs_mock_path, err);
+		return err;
+	}
+
+	n_files = fs_mock_get_n_files();
+	if (n_files == 0) {
+		fprintf(stderr, "extent cache is empty\n");
+		return EINVAL;
+	}
+
+	derr = ds_file_driver_open();
+	if (derr.err != DS_FILE_SUCCESS) {
+		fprintf(stderr, "ds_file_driver_open: %s\n",
+			ds_file_op_status_error(derr.err));
+		return derr.err;
+	}
+
+	derr = ds_file_handle_register(&scratch, 0);
+	if (derr.err != DS_FILE_SUCCESS) {
+		fprintf(stderr, "ds_file_handle_register(scratch): %s\n",
+			ds_file_op_status_error(derr.err));
+		return derr.err;
+	}
+	ds_file_handle_deregister(scratch);
+
+	iter->stats->n_files = n_files;
+	for (uint32_t i = 0; i < n_files; i++) {
+		err = -fs_mock_get_size(i, &size);
+		if (err) {
+			fprintf(stderr, "fs_mock_get_size(%u): %d\n", i, err);
+			return err;
+		}
+		iter->stats->avg_file_size += size;
+		if (size > iter->stats->max_file_size) {
+			iter->stats->max_file_size = size;
+		}
+	}
+	iter->stats->avg_file_size /= n_files;
+	iter->buffer_size = iter->stats->max_file_size;
+
+	return 0;
+}
+
 static int
 _xal_setup(struct fil_iter *iter, struct fil_dev *device)
 {
@@ -233,10 +310,30 @@ static int
 _create_entries(struct fil_iter *iter)
 {
 	struct fil_entry *entries;
-	struct xal_dentries root_dentries = iter->devs[0]->root_inode->content.dentries;
 	uint64_t n_entries = 0;
 	int err;
 	int k;
+
+	if (iter->type == FIL_OPENDS) {
+		/* Flat path table; mock_fh stored in entry.file, label
+		 * unused so entry.dir stays 0. */
+		n_entries = fs_mock_get_n_files();
+		entries = malloc(sizeof(struct fil_entry) * n_entries);
+		if (!entries) {
+			err = errno;
+			fprintf(stderr, "Could not allocate entries: %d\n", err);
+			return err;
+		}
+		for (uint64_t i = 0; i < n_entries; i++) {
+			entries[i].dir = 0;
+			entries[i].file = i;
+		}
+		iter->data->entries = entries;
+		iter->data->n_entries = n_entries;
+		return 0;
+	}
+
+	struct xal_dentries root_dentries = iter->devs[0]->root_inode->content.dentries;
 
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
 		n_entries += root_dentries.inodes[i].content.dentries.count;
@@ -323,6 +420,23 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 					return err;
 				}
 				break;
+			case FIL_OPENDS: {
+				ds_file_error_t derr;
+				err = cudaMalloc(&device->buffers[j], iter->buffer_size);
+				if (err) {
+					fprintf(stderr, "cudaMalloc(buffers[%d]): %d\n", i, err);
+					return err;
+				}
+				derr = ds_file_buf_register(device->buffers[j],
+							    iter->buffer_size, 0);
+				if (derr.err != DS_FILE_SUCCESS) {
+					fprintf(stderr,
+						"ds_file_buf_register(buffers[%d]): %s\n",
+						i, ds_file_op_status_error(derr.err));
+					return derr.err;
+				}
+				break;
+			}
 			}
 			if (!device->buffers[j]) {
 				err = errno;
@@ -452,10 +566,18 @@ fil_term(struct fil_iter *iter)
 				cudaFree(device->buffers[j]);
 			}
 			break;
+		case FIL_OPENDS:
+			for (uint32_t j = 0; j < device->n_buffers; j++) {
+				ds_file_buf_deregister(device->buffers[j]);
+				cudaFree(device->buffers[j]);
+			}
+			break;
 		}
-		xal_close(device->xal);
-		xnvme_dev_close(device->dev);
-		cuFileDriverClose();
+		if (iter->type != FIL_OPENDS) {
+			xal_close(device->xal);
+			xnvme_dev_close(device->dev);
+			cuFileDriverClose();
+		}
 		if (device->cpu_io) {
 			free(device->cpu_io->slbas);
 			free(device->cpu_io->elbas);
@@ -466,6 +588,10 @@ fil_term(struct fil_iter *iter)
 		}
 		free(device->buffers);
 		free(device);
+	}
+	if (iter->type == FIL_OPENDS) {
+		ds_file_driver_close();
+		fs_mock_reset();
 	}
 	if (iter->gds_io) {
 		free(iter->gds_io->descr);
@@ -529,6 +655,12 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
+	if (strcmp(opts->backend, "opends") == 0 && n_devs != 1) {
+		fprintf(stderr, "opends backend supports a single device only (got %u)\n",
+			n_devs);
+		return EINVAL;
+	}
+
 	_iter = malloc(sizeof(struct fil_iter));
 	if (!_iter) {
 		err = errno;
@@ -575,7 +707,8 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 			fil_term(_iter);
 			return err;
 		}
-		if (_iter->opts->data_dir[0] != '\0') {
+		if (_iter->type != FIL_OPENDS &&
+		    _iter->opts->data_dir[0] != '\0') {
 			err = _xal_setup(_iter, device);
 			if (err) {
 				fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
@@ -588,44 +721,54 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		_iter->n_devs++;
 	}
 
-	if (_iter->opts->data_dir[0] != '\0') {
-		err = _alloc(_iter, _iter->opts->batch_size);
+	if (_iter->type == FIL_OPENDS) {
+		err = _opends_setup(_iter);
 		if (err) {
 			fil_term(_iter);
 			return err;
 		}
-		switch (_iter->type) {
-		case FIL_GPU:
-			_iter->io_fn = fil_gpu_submit;
-			break;
-		case FIL_CPU:
-			_iter->io_fn = fil_cpu_submit;
-			break;
-		case FIL_FILE:
-			if (_iter->opts->async) {
-				_iter->io_fn = fil_gds_async_submit;
-			} else {
-				_iter->io_fn = fil_file_submit;
-			}
-			_find_prefix(_iter);
-			break;
-		}
+	}
 
-		// Create an entry for every file in every directory
-		err = _create_entries(_iter);
-		if (err) {
-			fil_term(_iter);
-			return err;
-		}
-
-		FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
-			    uint64_t);
-
-	} else {
+	if (_iter->type != FIL_OPENDS && _iter->opts->data_dir[0] == '\0') {
 		fprintf(stderr, "data_dir is required\n");
 		fil_term(_iter);
 		return EINVAL;
 	}
+
+	err = _alloc(_iter, _iter->opts->batch_size);
+	if (err) {
+		fil_term(_iter);
+		return err;
+	}
+	switch (_iter->type) {
+	case FIL_GPU:
+		_iter->io_fn = fil_gpu_submit;
+		break;
+	case FIL_CPU:
+		_iter->io_fn = fil_cpu_submit;
+		break;
+	case FIL_FILE:
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_gds_async_submit;
+		} else {
+			_iter->io_fn = fil_file_submit;
+		}
+		_find_prefix(_iter);
+		break;
+	case FIL_OPENDS:
+		_iter->io_fn = fil_opends_submit;
+		break;
+	}
+
+	// Create an entry for every file in every directory
+	err = _create_entries(_iter);
+	if (err) {
+		fil_term(_iter);
+		return err;
+	}
+
+	FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
+		    uint64_t);
 
 	(*iter) = _iter;
 
@@ -659,6 +802,7 @@ fil_opts_default()
 	struct fil_opts opts = {.data_dir = "",
 				.mnt = "/mnt",
 				.backend = "aisio-cpu",
+				.opends_fs_mock_path = NULL,
 				.iosize = 4096,
 				.gpu_nqueues = 128,
 				.gpu_tbsize = 64,

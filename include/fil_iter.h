@@ -5,7 +5,7 @@
 #include <fil_io.h>
 #include <stdint.h>
 
-enum fil_type { FIL_GPU, FIL_CPU, FIL_FILE };
+enum fil_type { FIL_GPU, FIL_CPU, FIL_FILE, FIL_OPENDS };
 
 struct fil_dev {
 	struct xnvme_dev *dev;

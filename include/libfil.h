@@ -33,6 +33,7 @@ struct fil_opts {
 	char *data_dir;	      ///< A directory containing subdirectories with files
 	char *mnt;	      ///< The mountpoint of the drive
 	char *backend;	      ///< The backend to use
+	char *opends_fs_mock_path; ///< Path to OpenDS fs_mock backing file (opends backend only)
 	uint64_t iosize;      ///< The number of bytes per I/O
 	uint32_t gpu_nqueues; ///< The number of GPU queues to create
 	uint32_t gpu_tbsize;  ///< The size of a GPU threadblock
@@ -71,6 +72,7 @@ struct fil_output {
  * data_dir = NULL
  * mnt = "/mnt"
  * backend = "aisio-cpu"
+ * opends_fs_mock_path = NULL
  * iosize = 4096
  * gpu_nqueues = 128
  * gpu_tbsize = 64
