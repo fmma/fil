@@ -9,6 +9,7 @@
 struct fil_entry {
 	uint64_t dir;
 	uint64_t file;
+	uint64_t size;
 };
 
 struct fil_data {

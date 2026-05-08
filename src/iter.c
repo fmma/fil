@@ -11,6 +11,7 @@
 #include <cufile.h>
 #include <ds_file.h>
 #include <fs_mock.h>
+#include <homi_types.h>
 #include <libxal.h>
 #include <libxnvme.h>
 
@@ -67,11 +68,8 @@ _xnvme_setup(struct fil_iter *iter, struct fil_dev *device, const char *uri)
 			return status.err;
 		}
 	} else if (strcmp(backend, "opends") == 0) {
-		/* OpenDS aisio owns the xNVMe device internally. Skip
-		 * fil's xnvme/XAL bring-up and let _opends_setup drive
-		 * dataset enumeration via the fs_mock extent cache. */
+		opts.be = "upcie";
 		iter->type = FIL_OPENDS;
-		return 0;
 	} else {
 		fprintf(stderr, "Invalid backend: %s\n", backend);
 		return EINVAL;
@@ -162,75 +160,6 @@ _find_prefix(struct fil_iter *iter)
 	}
 }
 
-/* Drive the aisio backend's mock filesystem layer in lieu of the XAL
- * walk we'd do for a kernel-mounted FS. fs_mock_init parses the extent
- * cache produced by OpenDS's tools/cache_extents; the path table doubles
- * as the dataset enumeration.
- *
- * Also opens the OpenDS driver and the underlying xNVMe device (via a
- * scratch handle on mock_fh 0) so the subsequent ds_file_alloc calls
- * have a backing xnvme_dev. The scratch handle is deregistered before
- * returning; xNVMe stays open for the iterator's lifetime. */
-static int
-_opends_setup(struct fil_iter *iter)
-{
-	int err;
-	uint32_t n_files;
-	uint64_t size;
-	ds_file_error_t derr;
-	ds_file_handle_t scratch;
-
-	if (!iter->opts->opends_fs_mock_path || iter->opts->opends_fs_mock_path[0] == '\0') {
-		fprintf(stderr, "opends backend requires --opends-fs-mock-path\n");
-		return EINVAL;
-	}
-
-	err = -fs_mock_init(iter->opts->opends_fs_mock_path);
-	if (err) {
-		fprintf(stderr, "fs_mock_init(%s): %d\n",
-			iter->opts->opends_fs_mock_path, err);
-		return err;
-	}
-
-	n_files = fs_mock_get_n_files();
-	if (n_files == 0) {
-		fprintf(stderr, "extent cache is empty\n");
-		return EINVAL;
-	}
-
-	derr = ds_file_driver_open();
-	if (derr.err != DS_FILE_SUCCESS) {
-		fprintf(stderr, "ds_file_driver_open: %s\n",
-			ds_file_op_status_error(derr.err));
-		return derr.err;
-	}
-
-	derr = ds_file_handle_register(&scratch, 0);
-	if (derr.err != DS_FILE_SUCCESS) {
-		fprintf(stderr, "ds_file_handle_register(scratch): %s\n",
-			ds_file_op_status_error(derr.err));
-		return derr.err;
-	}
-	ds_file_handle_deregister(scratch);
-
-	iter->stats->n_files = n_files;
-	for (uint32_t i = 0; i < n_files; i++) {
-		err = -fs_mock_get_size(i, &size);
-		if (err) {
-			fprintf(stderr, "fs_mock_get_size(%u): %d\n", i, err);
-			return err;
-		}
-		iter->stats->avg_file_size += size;
-		if (size > iter->stats->max_file_size) {
-			iter->stats->max_file_size = size;
-		}
-	}
-	iter->stats->avg_file_size /= n_files;
-	iter->buffer_size = iter->stats->max_file_size;
-
-	return 0;
-}
-
 static int
 _xal_setup(struct fil_iter *iter, struct fil_dev *device)
 {
@@ -307,33 +236,57 @@ _xal_setup(struct fil_iter *iter, struct fil_dev *device)
 }
 
 static int
+_opends_register_inode(struct xal *xal, struct xal_inode *file, uint64_t lba_nbytes,
+		      uint32_t xal_blksize, int *mock_fh_out)
+{
+	struct homi_extent *ext_buf;
+	uint32_t n_ext = file->content.extents.count;
+	uint64_t file_offset = 0;
+	int rc;
+
+	ext_buf = malloc(sizeof(*ext_buf) * n_ext);
+	if (!ext_buf) {
+		fprintf(stderr, "Could not allocate extent buffer for %s\n", file->name);
+		return ENOMEM;
+	}
+
+	for (uint32_t e = 0; e < n_ext; e++) {
+		struct xal_extent xext = file->content.extents.extent[e];
+		ext_buf[e].file_offset = file_offset;
+		ext_buf[e].slba = xal_fsbno_offset(xal, xext.start_block) / lba_nbytes;
+		ext_buf[e].length = (uint64_t)xext.nblocks * xal_blksize;
+		file_offset += ext_buf[e].length;
+	}
+
+	rc = fs_mock_register(ext_buf, n_ext);
+	free(ext_buf);
+	if (rc < 0) {
+		fprintf(stderr, "fs_mock_register(%s): %d\n", file->name, -rc);
+		return -rc;
+	}
+	*mock_fh_out = rc;
+	return 0;
+}
+
+static int
 _create_entries(struct fil_iter *iter)
 {
 	struct fil_entry *entries;
+	struct xal_dentries root_dentries;
+	struct xal *xal = NULL;
 	uint64_t n_entries = 0;
+	uint64_t lba_nbytes = 0;
+	uint32_t xal_blksize = 0;
 	int err;
 	int k;
 
-	if (iter->type == FIL_OPENDS) {
-		/* Flat path table; mock_fh stored in entry.file, label
-		 * unused so entry.dir stays 0. */
-		n_entries = fs_mock_get_n_files();
-		entries = malloc(sizeof(struct fil_entry) * n_entries);
-		if (!entries) {
-			err = errno;
-			fprintf(stderr, "Could not allocate entries: %d\n", err);
-			return err;
-		}
-		for (uint64_t i = 0; i < n_entries; i++) {
-			entries[i].dir = 0;
-			entries[i].file = i;
-		}
-		iter->data->entries = entries;
-		iter->data->n_entries = n_entries;
-		return 0;
-	}
+	root_dentries = iter->devs[0]->root_inode->content.dentries;
 
-	struct xal_dentries root_dentries = iter->devs[0]->root_inode->content.dentries;
+	if (iter->type == FIL_OPENDS) {
+		xal = iter->devs[0]->xal;
+		lba_nbytes = xnvme_dev_get_geo(iter->devs[0]->dev)->lba_nbytes;
+		xal_blksize = xal_get_sb_blocksize(xal);
+	}
 
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
 		n_entries += root_dentries.inodes[i].content.dentries.count;
@@ -348,9 +301,24 @@ _create_entries(struct fil_iter *iter)
 
 	k = 0;
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
-		for (uint32_t j = 0; j < root_dentries.inodes[i].content.dentries.count; j++) {
+		struct xal_inode *dir_inode = &root_dentries.inodes[i];
+		for (uint32_t j = 0; j < dir_inode->content.dentries.count; j++) {
+			struct xal_inode *file_inode = &dir_inode->content.dentries.inodes[j];
 			entries[k].dir = i;
-			entries[k].file = j;
+			if (iter->type == FIL_OPENDS) {
+				int mock_fh;
+				err = _opends_register_inode(xal, file_inode, lba_nbytes,
+							    xal_blksize, &mock_fh);
+				if (err) {
+					free(entries);
+					return err;
+				}
+				entries[k].file = (uint64_t)mock_fh;
+				entries[k].size = file_inode->size;
+			} else {
+				entries[k].file = j;
+				entries[k].size = 0;
+			}
 			k++;
 		}
 	}
@@ -536,14 +504,6 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	iter->data = malloc(sizeof(struct fil_data));
-	if (!iter->data) {
-		err = errno;
-		fprintf(stderr, "Could not allocate data: %d\n", err);
-		return err;
-	}
-	memset(iter->data, 0, sizeof(struct fil_data));
-
 	return 0;
 }
 
@@ -573,9 +533,13 @@ fil_term(struct fil_iter *iter)
 			}
 			break;
 		}
-		if (iter->type != FIL_OPENDS) {
+		if (device->xal) {
 			xal_close(device->xal);
+		}
+		if (device->dev) {
 			xnvme_dev_close(device->dev);
+		}
+		if (iter->type != FIL_OPENDS) {
 			cuFileDriverClose();
 		}
 		if (device->cpu_io) {
@@ -691,6 +655,12 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return err;
 	}
 
+	if (opts->data_dir[0] == '\0') {
+		fprintf(stderr, "data_dir is required\n");
+		fil_term(_iter);
+		return EINVAL;
+	}
+
 	for (uint32_t i = 0; i < n_devs; i++) {
 		struct fil_dev *device = malloc(sizeof(struct fil_dev));
 		if (!device) {
@@ -707,32 +677,92 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 			fil_term(_iter);
 			return err;
 		}
-		if (_iter->type != FIL_OPENDS &&
-		    _iter->opts->data_dir[0] != '\0') {
-			err = _xal_setup(_iter, device);
-			if (err) {
-				fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
-				xnvme_dev_close(device->dev);
-				fil_term(_iter);
-				return err;
-			}
+		err = _xal_setup(_iter, device);
+		if (err) {
+			fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
+			xnvme_dev_close(device->dev);
+			fil_term(_iter);
+			return err;
 		}
 		_iter->devs[i] = device;
 		_iter->n_devs++;
 	}
 
+	_iter->data = calloc(1, sizeof(struct fil_data));
+	if (!_iter->data) {
+		err = errno;
+		fprintf(stderr, "Could not allocate data: %d\n", err);
+		fil_term(_iter);
+		return err;
+	}
+
 	if (_iter->type == FIL_OPENDS) {
-		err = _opends_setup(_iter);
+		ds_file_error_t derr = ds_file_driver_open();
+		if (derr.err != DS_FILE_SUCCESS) {
+			fprintf(stderr, "ds_file_driver_open: %s\n",
+				ds_file_op_status_error(derr.err));
+			fil_term(_iter);
+			return derr.err;
+		}
+		err = -fs_mock_init(dev_uris[0]);
 		if (err) {
+			fprintf(stderr, "fs_mock_init(%s): %d\n", dev_uris[0], err);
 			fil_term(_iter);
 			return err;
 		}
 	}
 
-	if (_iter->type != FIL_OPENDS && _iter->opts->data_dir[0] == '\0') {
-		fprintf(stderr, "data_dir is required\n");
+	// Create an entry for every file in every directory. For opends this
+	// also walks XAL extents and registers each leaf with fs_mock.
+	err = _create_entries(_iter);
+	if (err) {
 		fil_term(_iter);
-		return EINVAL;
+		return err;
+	}
+
+	if (_iter->type == FIL_OPENDS) {
+		/* Hand off the device to OpenDS aisio. fil's xnvme and XAL
+		 * handles are no longer needed (extents were captured into
+		 * fs_mock by _create_entries). xnvme upcie close drives the
+		 * controller through CC.SHN, so reset the PCI function before
+		 * letting OpenDS reopen with upcie-cuda — same controller-state
+		 * recovery the bench unbind step does. */
+		struct fil_dev *device = _iter->devs[0];
+		char reset_path[64];
+		FILE *fp;
+
+		xal_close(device->xal);
+		device->xal = NULL;
+		xnvme_dev_close(device->dev);
+		device->dev = NULL;
+
+		snprintf(reset_path, sizeof(reset_path),
+			 "/sys/bus/pci/devices/%s/reset", dev_uris[0]);
+		fp = fopen(reset_path, "w");
+		if (!fp) {
+			err = errno;
+			fprintf(stderr, "fopen(%s): %d\n", reset_path, err);
+			fil_term(_iter);
+			return err;
+		}
+		if (fputs("1\n", fp) == EOF) {
+			err = errno;
+			fprintf(stderr, "fputs(%s): %d\n", reset_path, err);
+			fclose(fp);
+			fil_term(_iter);
+			return err;
+		}
+		fclose(fp);
+
+		ds_file_handle_t scratch;
+		ds_file_error_t derr = ds_file_handle_register(&scratch, 0);
+		if (derr.err != DS_FILE_SUCCESS) {
+			fprintf(stderr, "ds_file_handle_register(scratch): %s\n",
+				ds_file_op_status_error(derr.err));
+			fil_term(_iter);
+			return derr.err;
+		}
+		ds_file_handle_deregister(scratch);
 	}
 
 	err = _alloc(_iter, _iter->opts->batch_size);
@@ -758,13 +788,6 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 	case FIL_OPENDS:
 		_iter->io_fn = fil_opends_submit;
 		break;
-	}
-
-	// Create an entry for every file in every directory
-	err = _create_entries(_iter);
-	if (err) {
-		fil_term(_iter);
-		return err;
 	}
 
 	FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
@@ -802,7 +825,6 @@ fil_opts_default()
 	struct fil_opts opts = {.data_dir = "",
 				.mnt = "/mnt",
 				.backend = "aisio-cpu",
-				.opends_fs_mock_path = NULL,
 				.iosize = 4096,
 				.gpu_nqueues = 128,
 				.gpu_tbsize = 64,

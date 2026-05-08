@@ -12,7 +12,6 @@
 #include <fil_iter.h>
 
 #include <ds_file.h>
-#include <fs_mock.h>
 
 #define ELAPSED(s, e) \
 	((double)((e).tv_sec - (s).tv_sec) + (double)((e).tv_nsec - (s).tv_nsec) / 1e9)
@@ -35,17 +34,13 @@ fil_opends_submit(struct fil_iter *iter)
 	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 		entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
 		mock_fh = (int)entry.file;
-
-		if (fs_mock_get_size((uint32_t)mock_fh, &nbytes) < 0) {
-			fprintf(stderr, "fs_mock_get_size(%d) failed\n", mock_fh);
-			return EIO;
-		}
+		nbytes = entry.size;
 
 		buf_id = device->buf++ % device->n_buffers;
 		buffer = device->buffers[buf_id];
 
 		iter->output->buf_len[buf_id] = nbytes;
-		iter->output->labels[buf_id] = 0;
+		iter->output->labels[buf_id] = (uint32_t)entry.dir;
 		iter->stats->bytes += nbytes;
 		iter->stats->io++;
 
