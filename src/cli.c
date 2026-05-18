@@ -36,7 +36,7 @@ print_help(const char *name)
 		"\t --batch-size \t | \t The number of files to read per batch (default = 1)\n");
 	fprintf(stderr, "\t --batches \t | \t The number of batches to read (default = 1)\n");
 	fprintf(stderr, "\t --buffered \t | \t Don't open with O_DIRECT when using POSIX\n");
-	fprintf(stderr, "\t --async \t | \t Use the async API when using GDS\n");
+	fprintf(stderr, "\t --async \t | \t Use the async API (gds, opends backends)\n");
 	fprintf(stderr, "\t --summary \t | \t Print IO and dataset stats\n");
 	fprintf(stderr, "\t --help \t | \t Print this message\n");
 }

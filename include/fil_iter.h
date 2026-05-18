@@ -27,6 +27,7 @@ struct fil_iter {
 	struct fil_opts *opts;
 	struct fil_output *output;
 	struct fil_gds_io *gds_io;
+	struct fil_opends_io *opends_io;
 	int (*io_fn)(struct fil_iter *iter);
 	uint64_t buffer_size;
 	uint32_t n_devs;

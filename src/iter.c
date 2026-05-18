@@ -10,8 +10,8 @@
 #include <cuda_runtime.h>
 #include <cufile.h>
 #include <ds_file.h>
+#include <ds_file_async.h>
 #include <fs_mock.h>
-#include <homi_types.h>
 #include <libxal.h>
 #include <libxnvme.h>
 
@@ -236,57 +236,15 @@ _xal_setup(struct fil_iter *iter, struct fil_dev *device)
 }
 
 static int
-_opends_register_inode(struct xal *xal, struct xal_inode *file, uint64_t lba_nbytes,
-		      uint32_t xal_blksize, int *mock_fh_out)
-{
-	struct homi_extent *ext_buf;
-	uint32_t n_ext = file->content.extents.count;
-	uint64_t file_offset = 0;
-	int rc;
-
-	ext_buf = malloc(sizeof(*ext_buf) * n_ext);
-	if (!ext_buf) {
-		fprintf(stderr, "Could not allocate extent buffer for %s\n", file->name);
-		return ENOMEM;
-	}
-
-	for (uint32_t e = 0; e < n_ext; e++) {
-		struct xal_extent xext = file->content.extents.extent[e];
-		ext_buf[e].file_offset = file_offset;
-		ext_buf[e].slba = xal_fsbno_offset(xal, xext.start_block) / lba_nbytes;
-		ext_buf[e].length = (uint64_t)xext.nblocks * xal_blksize;
-		file_offset += ext_buf[e].length;
-	}
-
-	rc = fs_mock_register(ext_buf, n_ext);
-	free(ext_buf);
-	if (rc < 0) {
-		fprintf(stderr, "fs_mock_register(%s): %d\n", file->name, -rc);
-		return -rc;
-	}
-	*mock_fh_out = rc;
-	return 0;
-}
-
-static int
 _create_entries(struct fil_iter *iter)
 {
 	struct fil_entry *entries;
 	struct xal_dentries root_dentries;
-	struct xal *xal = NULL;
 	uint64_t n_entries = 0;
-	uint64_t lba_nbytes = 0;
-	uint32_t xal_blksize = 0;
 	int err;
 	int k;
 
 	root_dentries = iter->devs[0]->root_inode->content.dentries;
-
-	if (iter->type == FIL_OPENDS) {
-		xal = iter->devs[0]->xal;
-		lba_nbytes = xnvme_dev_get_geo(iter->devs[0]->dev)->lba_nbytes;
-		xal_blksize = xal_get_sb_blocksize(xal);
-	}
 
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
 		n_entries += root_dentries.inodes[i].content.dentries.count;
@@ -306,18 +264,14 @@ _create_entries(struct fil_iter *iter)
 			struct xal_inode *file_inode = &dir_inode->content.dentries.inodes[j];
 			entries[k].dir = i;
 			if (iter->type == FIL_OPENDS) {
-				int mock_fh;
-				err = _opends_register_inode(xal, file_inode, lba_nbytes,
-							    xal_blksize, &mock_fh);
+				err = fil_opends_register_entry(iter, file_inode,
+								&entries[k].file);
 				if (err) {
 					free(entries);
 					return err;
 				}
-				entries[k].file = (uint64_t)mock_fh;
-				entries[k].size = file_inode->size;
 			} else {
 				entries[k].file = j;
-				entries[k].size = 0;
 			}
 			k++;
 		}
@@ -451,7 +405,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->async) {
+	if (iter->opts->async && iter->type == FIL_FILE) {
 		iter->gds_io = malloc(sizeof(struct fil_gds_io));
 		if (!iter->gds_io) {
 			err = errno;
@@ -504,6 +458,13 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
+	if (iter->opts->async && iter->type == FIL_OPENDS) {
+		err = fil_opends_io_alloc(iter);
+		if (err) {
+			return err;
+		}
+	}
+
 	return 0;
 }
 
@@ -553,6 +514,7 @@ fil_term(struct fil_iter *iter)
 		free(device->buffers);
 		free(device);
 	}
+	fil_opends_io_free(iter);
 	if (iter->type == FIL_OPENDS) {
 		ds_file_driver_close();
 		fs_mock_reset();
@@ -614,8 +576,10 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->async && strcmp(opts->backend, "gds") != 0) {
-		fprintf(stderr, "opts->async == true is only compatible with GDS backend");
+	if (opts->async && strcmp(opts->backend, "gds") != 0
+			&& strcmp(opts->backend, "opends") != 0) {
+		fprintf(stderr,
+			"opts->async is only compatible with gds or opends backends\n");
 		return EINVAL;
 	}
 
@@ -786,7 +750,11 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		_find_prefix(_iter);
 		break;
 	case FIL_OPENDS:
-		_iter->io_fn = fil_opends_submit;
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_opends_async_submit;
+		} else {
+			_iter->io_fn = fil_opends_submit;
+		}
 		break;
 	}
 
