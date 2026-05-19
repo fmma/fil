@@ -583,6 +583,13 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
+	if (opts->verify
+	    && (strcmp(opts->backend, "opends") != 0 || !opts->async)) {
+		fprintf(stderr,
+			"opts->verify is only compatible with opends + async\n");
+		return EINVAL;
+	}
+
 	if (strcmp(opts->backend, "opends") == 0 && n_devs != 1) {
 		fprintf(stderr, "opends backend supports a single device only (got %u)\n",
 			n_devs);

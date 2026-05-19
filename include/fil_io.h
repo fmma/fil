@@ -45,6 +45,13 @@ struct fil_opends_io {
 	size_t *expected;
 	ssize_t *actual;
 	cudaStream_t *streams;
+	/* --verify: side buffer for an independent sync read of each
+	 * entry plus two host scratch areas to memcmp against. NULL when
+	 * --verify is off. */
+	void *verify_dev_buf;
+	void *verify_host_async;
+	void *verify_host_sync;
+	size_t verify_buf_size;
 };
 
 int

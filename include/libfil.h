@@ -40,6 +40,7 @@ struct fil_opts {
 	uint32_t batch_size;  ///< The number of files per batch
 	bool buffered;	      ///< Whether to use O_DIRECT with POSIX
 	bool async;	      ///< Whether to use async API with GDS
+	bool verify;	      ///< Compare async results against a sync read
 };
 
 /**

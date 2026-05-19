@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include <cuda_runtime.h>
@@ -102,6 +103,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 	ds_file_error_t derr;
 	off_t offset = 0;
 	int err;
+	uint64_t buf_start = device->buf;
 
 	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
@@ -166,6 +168,70 @@ fil_opends_async_submit(struct fil_iter *iter)
 	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
 	iter->stats->io_time += ELAPSED(start, end);
 
+	if (iter->opts->verify) {
+		for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+			size_t nbytes = io->expected[i];
+			void *async_dev =
+				device->buffers[(buf_start + i) % device->n_buffers];
+			ssize_t got;
+
+			if (nbytes > io->verify_buf_size) {
+				fprintf(stderr,
+					"verify: entry %u nbytes %lu exceeds buf %lu\n",
+					i, (unsigned long)nbytes,
+					(unsigned long)io->verify_buf_size);
+				return EIO;
+			}
+
+			err = cudaMemcpy(io->verify_host_async, async_dev,
+					 nbytes, cudaMemcpyDeviceToHost);
+			if (err) {
+				fprintf(stderr,
+					"verify: cudaMemcpy async D2H: %d\n", err);
+				return err;
+			}
+
+			got = ds_file_read(io->handles[i], io->verify_dev_buf,
+					   nbytes, 0, 0);
+			if (got < 0) {
+				fprintf(stderr,
+					"verify: ds_file_read(%d): %s\n",
+					(int)iter->data->entries[
+						(iter->data->index - iter->opts->batch_size + i)
+						% iter->data->n_entries].file,
+					ds_file_op_status_error(
+						(ds_file_op_error_t)(-got)));
+				return EIO;
+			}
+			if ((size_t)got != nbytes) {
+				fprintf(stderr,
+					"verify: sync short read: expected %lu, got %ld\n",
+					(unsigned long)nbytes, (long)got);
+				return EIO;
+			}
+
+			err = cudaMemcpy(io->verify_host_sync, io->verify_dev_buf,
+					 nbytes, cudaMemcpyDeviceToHost);
+			if (err) {
+				fprintf(stderr,
+					"verify: cudaMemcpy sync D2H: %d\n", err);
+				return err;
+			}
+
+			if (memcmp(io->verify_host_async, io->verify_host_sync,
+				   nbytes) != 0) {
+				fprintf(stderr,
+					"verify: MISMATCH at batch entry %u (mock_fh=%d, nbytes=%lu)\n",
+					i,
+					(int)iter->data->entries[
+						(iter->data->index - iter->opts->batch_size + i)
+						% iter->data->n_entries].file,
+					(unsigned long)nbytes);
+				return EIO;
+			}
+		}
+	}
+
 	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 		ds_file_handle_deregister(io->handles[i]);
 	}
@@ -214,6 +280,7 @@ fil_opends_io_alloc(struct fil_iter *iter)
 {
 	uint32_t batch_size = iter->opts->batch_size;
 	int err;
+	ds_file_error_t derr;
 
 	iter->opends_io = calloc(1, sizeof(struct fil_opends_io));
 	if (!iter->opends_io) {
@@ -257,12 +324,36 @@ fil_opends_io_alloc(struct fil_iter *iter)
 			fprintf(stderr, "Could not setup CUDA Stream, err: %d\n", err);
 			return err;
 		}
-		ds_file_error_t derr =
-			ds_file_stream_register(iter->opends_io->streams[i], 0);
+		derr = ds_file_stream_register(iter->opends_io->streams[i], 0);
 		if (derr.err != DS_FILE_SUCCESS) {
 			fprintf(stderr, "ds_file_stream_register: %s\n",
 				ds_file_op_status_error(derr.err));
 			return derr.err;
+		}
+	}
+
+	if (iter->opts->verify) {
+		iter->opends_io->verify_buf_size = iter->buffer_size;
+		err = cudaMalloc(&iter->opends_io->verify_dev_buf,
+				 iter->buffer_size);
+		if (err) {
+			fprintf(stderr, "cudaMalloc(verify_dev_buf): %d\n", err);
+			return err;
+		}
+		derr = ds_file_buf_register(iter->opends_io->verify_dev_buf,
+					    iter->buffer_size, 0);
+		if (derr.err != DS_FILE_SUCCESS) {
+			fprintf(stderr,
+				"ds_file_buf_register(verify_dev_buf): %s\n",
+				ds_file_op_status_error(derr.err));
+			return derr.err;
+		}
+		iter->opends_io->verify_host_async = malloc(iter->buffer_size);
+		iter->opends_io->verify_host_sync = malloc(iter->buffer_size);
+		if (!iter->opends_io->verify_host_async ||
+		    !iter->opends_io->verify_host_sync) {
+			fprintf(stderr, "Could not allocate verify host buffers\n");
+			return ENOMEM;
 		}
 	}
 	return 0;
@@ -281,6 +372,12 @@ fil_opends_io_free(struct fil_iter *iter)
 		cudaStreamDestroy(iter->opends_io->streams[i]);
 	}
 	free(iter->opends_io->streams);
+	if (iter->opends_io->verify_dev_buf) {
+		ds_file_buf_deregister(iter->opends_io->verify_dev_buf);
+		cudaFree(iter->opends_io->verify_dev_buf);
+	}
+	free(iter->opends_io->verify_host_async);
+	free(iter->opends_io->verify_host_sync);
 	free(iter->opends_io);
 	iter->opends_io = NULL;
 }
