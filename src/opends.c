@@ -3,11 +3,14 @@
 #endif
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <cuda_runtime.h>
 
@@ -169,66 +172,83 @@ fil_opends_async_submit(struct fil_iter *iter)
 	iter->stats->io_time += ELAPSED(start, end);
 
 	if (iter->opts->verify) {
+		uint64_t batch_start_idx =
+			iter->data->index - iter->opts->batch_size;
 		for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 			size_t nbytes = io->expected[i];
+			int sampled_fh = (int)iter->data->entries[
+				(batch_start_idx + i) % iter->data->n_entries].file;
 			void *async_dev =
 				device->buffers[(buf_start + i) % device->n_buffers];
-			ssize_t got;
+			const char *orig_path = NULL;
+			char dump_path[PATH_MAX];
+			FILE *dump_fp;
+			size_t written;
 
-			if (nbytes > io->verify_buf_size) {
+			if (io->written_bytes >= iter->opts->verify_cap_bytes)
+				break;
+
+			if (iter->opts->verify_rate < 1.0
+			    && (double)rand() / (double)RAND_MAX >=
+			       iter->opts->verify_rate)
+				continue;
+
+			if (nbytes > io->dump_buf_size) {
 				fprintf(stderr,
 					"verify: entry %u nbytes %lu exceeds buf %lu\n",
 					i, (unsigned long)nbytes,
-					(unsigned long)io->verify_buf_size);
+					(unsigned long)io->dump_buf_size);
 				return EIO;
 			}
 
-			err = cudaMemcpy(io->verify_host_async, async_dev,
-					 nbytes, cudaMemcpyDeviceToHost);
+			if (snprintf(dump_path, sizeof(dump_path),
+				     "%s/%d.bin", iter->opts->verify_dir,
+				     sampled_fh) >= (int)sizeof(dump_path)) {
+				fprintf(stderr, "verify_dir too long\n");
+				return ENAMETOOLONG;
+			}
+
+			if (access(dump_path, F_OK) == 0)
+				continue;
+
+			fs_mock_get_path(sampled_fh, &orig_path);
+
+			err = cudaMemcpy(io->dump_host_buf, async_dev, nbytes,
+					 cudaMemcpyDeviceToHost);
 			if (err) {
 				fprintf(stderr,
-					"verify: cudaMemcpy async D2H: %d\n", err);
+					"verify: cudaMemcpy D2H: %d\n", err);
 				return err;
 			}
 
-			got = ds_file_read(io->handles[i], io->verify_dev_buf,
-					   nbytes, 0, 0);
-			if (got < 0) {
+			dump_fp = fopen(dump_path, "wb");
+			if (!dump_fp) {
+				err = errno;
+				fprintf(stderr, "verify: fopen(%s): %d\n",
+					dump_path, err);
+				return err;
+			}
+			written = fwrite(io->dump_host_buf, 1, nbytes, dump_fp);
+			if (written != nbytes) {
+				err = errno;
 				fprintf(stderr,
-					"verify: ds_file_read(%d): %s\n",
-					(int)iter->data->entries[
-						(iter->data->index - iter->opts->batch_size + i)
-						% iter->data->n_entries].file,
-					ds_file_op_status_error(
-						(ds_file_op_error_t)(-got)));
+					"verify: fwrite(%s): wrote %zu of %zu (%d)\n",
+					dump_path, written, nbytes, err);
+				fclose(dump_fp);
 				return EIO;
 			}
-			if ((size_t)got != nbytes) {
-				fprintf(stderr,
-					"verify: sync short read: expected %lu, got %ld\n",
-					(unsigned long)nbytes, (long)got);
-				return EIO;
-			}
-
-			err = cudaMemcpy(io->verify_host_sync, io->verify_dev_buf,
-					 nbytes, cudaMemcpyDeviceToHost);
-			if (err) {
-				fprintf(stderr,
-					"verify: cudaMemcpy sync D2H: %d\n", err);
+			if (fclose(dump_fp) != 0) {
+				err = errno;
+				fprintf(stderr, "verify: fclose(%s): %d\n",
+					dump_path, err);
 				return err;
 			}
 
-			if (memcmp(io->verify_host_async, io->verify_host_sync,
-				   nbytes) != 0) {
-				fprintf(stderr,
-					"verify: MISMATCH at batch entry %u (mock_fh=%d, nbytes=%lu)\n",
-					i,
-					(int)iter->data->entries[
-						(iter->data->index - iter->opts->batch_size + i)
-						% iter->data->n_entries].file,
-					(unsigned long)nbytes);
-				return EIO;
-			}
+			fprintf(io->manifest_fp, "%d\t%s\t%lu\n", sampled_fh,
+				orig_path ? orig_path : "", (unsigned long)nbytes);
+			fflush(io->manifest_fp);
+
+			io->written_bytes += nbytes;
 		}
 	}
 
@@ -240,7 +260,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 
 int
 fil_opends_register_entry(struct fil_iter *iter, struct xal_inode *file_inode,
-			  uint64_t *mock_fh_out)
+			  const char *path, uint64_t *mock_fh_out)
 {
 	struct xal *xal = iter->devs[0]->xal;
 	uint64_t lba_nbytes = xnvme_dev_get_geo(iter->devs[0]->dev)->lba_nbytes;
@@ -265,7 +285,7 @@ fil_opends_register_entry(struct fil_iter *iter, struct xal_inode *file_inode,
 		file_offset += ext_buf[e].length;
 	}
 
-	rc = fs_mock_register(ext_buf, n_ext, file_inode->size);
+	rc = fs_mock_register(ext_buf, n_ext, file_inode->size, path);
 	free(ext_buf);
 	if (rc < 0) {
 		fprintf(stderr, "fs_mock_register(%s): %d\n", file_inode->name, -rc);
@@ -333,26 +353,35 @@ fil_opends_io_alloc(struct fil_iter *iter)
 	}
 
 	if (iter->opts->verify) {
-		iter->opends_io->verify_buf_size = iter->buffer_size;
-		err = cudaMalloc(&iter->opends_io->verify_dev_buf,
-				 iter->buffer_size);
-		if (err) {
-			fprintf(stderr, "cudaMalloc(verify_dev_buf): %d\n", err);
+		char manifest_path[PATH_MAX];
+
+		if (mkdir(iter->opts->verify_dir, 0755) < 0 && errno != EEXIST) {
+			err = errno;
+			fprintf(stderr, "mkdir(%s): %d\n",
+				iter->opts->verify_dir, err);
 			return err;
 		}
-		derr = ds_file_buf_register(iter->opends_io->verify_dev_buf,
-					    iter->buffer_size, 0);
-		if (derr.err != DS_FILE_SUCCESS) {
-			fprintf(stderr,
-				"ds_file_buf_register(verify_dev_buf): %s\n",
-				ds_file_op_status_error(derr.err));
-			return derr.err;
+
+		if (snprintf(manifest_path, sizeof(manifest_path),
+			     "%s/manifest.tsv", iter->opts->verify_dir)
+		    >= (int)sizeof(manifest_path)) {
+			fprintf(stderr, "verify_dir too long: %s\n",
+				iter->opts->verify_dir);
+			return ENAMETOOLONG;
 		}
-		iter->opends_io->verify_host_async = malloc(iter->buffer_size);
-		iter->opends_io->verify_host_sync = malloc(iter->buffer_size);
-		if (!iter->opends_io->verify_host_async ||
-		    !iter->opends_io->verify_host_sync) {
-			fprintf(stderr, "Could not allocate verify host buffers\n");
+		iter->opends_io->manifest_fp = fopen(manifest_path, "w");
+		if (!iter->opends_io->manifest_fp) {
+			err = errno;
+			fprintf(stderr, "fopen(%s): %d\n", manifest_path, err);
+			return err;
+		}
+		fprintf(iter->opends_io->manifest_fp,
+			"# mock_fh\tpath\tnbytes\n");
+
+		iter->opends_io->dump_buf_size = iter->buffer_size;
+		iter->opends_io->dump_host_buf = malloc(iter->buffer_size);
+		if (!iter->opends_io->dump_host_buf) {
+			fprintf(stderr, "Could not allocate verify host buffer\n");
 			return ENOMEM;
 		}
 	}
@@ -372,12 +401,10 @@ fil_opends_io_free(struct fil_iter *iter)
 		cudaStreamDestroy(iter->opends_io->streams[i]);
 	}
 	free(iter->opends_io->streams);
-	if (iter->opends_io->verify_dev_buf) {
-		ds_file_buf_deregister(iter->opends_io->verify_dev_buf);
-		cudaFree(iter->opends_io->verify_dev_buf);
+	if (iter->opends_io->manifest_fp) {
+		fclose(iter->opends_io->manifest_fp);
 	}
-	free(iter->opends_io->verify_host_async);
-	free(iter->opends_io->verify_host_sync);
+	free(iter->opends_io->dump_host_buf);
 	free(iter->opends_io);
 	iter->opends_io = NULL;
 }

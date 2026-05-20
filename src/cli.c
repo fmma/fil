@@ -37,7 +37,10 @@ print_help(const char *name)
 	fprintf(stderr, "\t --batches \t | \t The number of batches to read (default = 1)\n");
 	fprintf(stderr, "\t --buffered \t | \t Don't open with O_DIRECT when using POSIX\n");
 	fprintf(stderr, "\t --async \t | \t Use the async API (gds, opends backends)\n");
-	fprintf(stderr, "\t --verify \t | \t Re-read each batch via sync ds_file_read and memcmp against the async result (opends + --async only)\n");
+	fprintf(stderr, "\t --verify \t | \t Sample async-read buffers to verify-dir for offline POSIX comparison (opends + --async only)\n");
+	fprintf(stderr, "\t --verify-dir \t | \t Output directory for sampled buffers + manifest (default = /tmp/fil-verify)\n");
+	fprintf(stderr, "\t --verify-rate \t | \t Probability in [0, 1] that an entry is sampled (default = 0.01)\n");
+	fprintf(stderr, "\t --verify-cap-bytes \t | \t Stop dumping once this many bytes have been written (default = 1 GiB)\n");
 	fprintf(stderr, "\t --summary \t | \t Print IO and dataset stats\n");
 	fprintf(stderr, "\t --help \t | \t Print this message\n");
 }
@@ -99,6 +102,13 @@ parse_args(int argc, char *argv[], struct fil_cli_args *args, struct fil_opts *o
 			opts->async = true;
 		} else if (strcmp(argv[i], "--verify") == 0) {
 			opts->verify = true;
+		} else if (strcmp(argv[i], "--verify-dir") == 0) {
+			opts->verify_dir = argv[++i];
+		} else if (strcmp(argv[i], "--verify-rate") == 0) {
+			opts->verify_rate = strtod(argv[++i], NULL);
+		} else if (strcmp(argv[i], "--verify-cap-bytes") == 0) {
+			opts->verify_cap_bytes =
+				strtoull(argv[++i], (char **)NULL, 10);
 		} else if (strcmp(argv[i], "--summary") == 0) {
 			args->summary = true;
 		} else if (strcmp(argv[i], "--help") == 0) {

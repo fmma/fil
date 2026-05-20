@@ -6,6 +6,7 @@
 #include <ds_file.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 
 struct fil_iter;
 struct xal_inode;
@@ -45,13 +46,12 @@ struct fil_opends_io {
 	size_t *expected;
 	ssize_t *actual;
 	cudaStream_t *streams;
-	/* --verify: side buffer for an independent sync read of each
-	 * entry plus two host scratch areas to memcmp against. NULL when
-	 * --verify is off. */
-	void *verify_dev_buf;
-	void *verify_host_async;
-	void *verify_host_sync;
-	size_t verify_buf_size;
+	/* --verify: sample async-read buffers to a SATA directory for
+	 * later offline POSIX comparison. NULL/0 when --verify is off. */
+	FILE *manifest_fp;
+	void *dump_host_buf;
+	size_t dump_buf_size;
+	uint64_t written_bytes;
 };
 
 int
@@ -74,7 +74,7 @@ fil_opends_async_submit(struct fil_iter *iter);
 
 int
 fil_opends_register_entry(struct fil_iter *iter, struct xal_inode *file_inode,
-			  uint64_t *mock_fh_out);
+			  const char *path, uint64_t *mock_fh_out);
 
 int
 fil_opends_io_alloc(struct fil_iter *iter);

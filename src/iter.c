@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -264,7 +265,15 @@ _create_entries(struct fil_iter *iter)
 			struct xal_inode *file_inode = &dir_inode->content.dentries.inodes[j];
 			entries[k].dir = i;
 			if (iter->type == FIL_OPENDS) {
+				char abs_path[PATH_MAX];
+				const char *path_arg = NULL;
+				if (iter->opts->verify) {
+					strcpy(abs_path, iter->opts->mnt);
+					path_prepend(abs_path, file_inode);
+					path_arg = abs_path;
+				}
 				err = fil_opends_register_entry(iter, file_inode,
+								path_arg,
 								&entries[k].file);
 				if (err) {
 					free(entries);
@@ -590,6 +599,19 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
+	if (opts->verify) {
+		if (!opts->verify_dir || opts->verify_dir[0] == '\0') {
+			fprintf(stderr, "opts->verify_dir is required when verify is set\n");
+			return EINVAL;
+		}
+		if (opts->verify_rate < 0.0 || opts->verify_rate > 1.0) {
+			fprintf(stderr,
+				"opts->verify_rate must be in [0, 1] (got %f)\n",
+				opts->verify_rate);
+			return EINVAL;
+		}
+	}
+
 	if (strcmp(opts->backend, "opends") == 0 && n_devs != 1) {
 		fprintf(stderr, "opends backend supports a single device only (got %u)\n",
 			n_devs);
@@ -806,7 +828,11 @@ fil_opts_default()
 				.queue_depth = 1024,
 				.batch_size = 1,
 				.buffered = false,
-				.async = false};
+				.async = false,
+				.verify = false,
+				.verify_dir = "/tmp/fil-verify",
+				.verify_rate = 0.01,
+				.verify_cap_bytes = 1ULL << 30};
 
 	return opts;
 }

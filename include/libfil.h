@@ -40,7 +40,10 @@ struct fil_opts {
 	uint32_t batch_size;  ///< The number of files per batch
 	bool buffered;	      ///< Whether to use O_DIRECT with POSIX
 	bool async;	      ///< Whether to use async API with GDS
-	bool verify;	      ///< Compare async results against a sync read
+	bool verify;	      ///< Sample async batches to verify_dir for offline POSIX check
+	char *verify_dir;     ///< Output directory for sampled buffers + manifest
+	double verify_rate;   ///< Probability (0..1) each entry is sampled
+	uint64_t verify_cap_bytes; ///< Stop dumping once this many bytes have been written
 };
 
 /**
