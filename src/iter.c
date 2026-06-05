@@ -1,14 +1,20 @@
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <libfil.h>
 #include <fil_io.h>
 #include <fil_iter.h>
 #include <fil_util.h>
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <ds_file.h>
+#include <ds_file_async.h>
 #include <libxal.h>
 #include <libxnvme.h>
 
@@ -64,6 +70,9 @@ _xnvme_setup(struct fil_iter *iter, struct fil_dev *device, const char *uri)
 			fprintf(stderr, "Could not open cuFile driver: %d\n", status.err);
 			return status.err;
 		}
+	} else if (strcmp(backend, "opends") == 0) {
+		opts.be = "upcie";
+		iter->type = FIL_OPENDS;
 	} else {
 		fprintf(stderr, "Invalid backend: %s\n", backend);
 		return EINVAL;
@@ -131,12 +140,12 @@ find_data_dir(struct xal *FIL_UNUSED(xal), struct xal_inode *inode, void *cb_arg
 }
 
 static void
-path_prepend(char *path, struct xal_inode *node)
+path_prepend(struct xal *xal, char *path, struct xal_inode *node)
 {
-	if (node->name[0] == '\0') {
+	if (node->name[0] == '\0' || node->parent_idx == XAL_POOL_IDX_NONE) {
 		return;
 	}
-	path_prepend(path, node->parent);
+	path_prepend(xal, path, xal_inode_at(xal, node->parent_idx));
 	strcat(path, "/");
 	strcat(path, node->name);
 }
@@ -150,7 +159,7 @@ _find_prefix(struct fil_iter *iter)
 		device = iter->devs[i];
 		prefix = device->file_io->prefix;
 		strcpy(prefix, iter->opts->mnt);
-		path_prepend(prefix, device->root_inode);
+		path_prepend(device->xal, prefix, device->root_inode);
 	}
 }
 
@@ -221,7 +230,7 @@ _xal_setup(struct fil_iter *iter, struct fil_dev *device)
 
 	// Sort the directories so we can derive labels
 	if (device->root_inode->content.dentries.count > 1) {
-		qsort(device->root_inode->content.dentries.inodes,
+		qsort(xal_inode_at(xal, device->root_inode->content.dentries.inodes_idx),
 		      device->root_inode->content.dentries.count, sizeof(struct xal_inode),
 		      inode_cmp);
 	}
@@ -233,13 +242,17 @@ static int
 _create_entries(struct fil_iter *iter)
 {
 	struct fil_entry *entries;
-	struct xal_dentries root_dentries = iter->devs[0]->root_inode->content.dentries;
+	struct xal *xal = iter->devs[0]->xal;
+	struct xal_dentries root_dentries;
 	uint64_t n_entries = 0;
 	int err;
 	int k;
 
+	root_dentries = iter->devs[0]->root_inode->content.dentries;
+
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
-		n_entries += root_dentries.inodes[i].content.dentries.count;
+		n_entries += xal_inode_at(xal, root_dentries.inodes_idx + i)
+				 ->content.dentries.count;
 	}
 
 	entries = malloc(sizeof(struct fil_entry) * n_entries);
@@ -251,7 +264,8 @@ _create_entries(struct fil_iter *iter)
 
 	k = 0;
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
-		for (uint32_t j = 0; j < root_dentries.inodes[i].content.dentries.count; j++) {
+		struct xal_inode *dir_inode = xal_inode_at(xal, root_dentries.inodes_idx + i);
+		for (uint32_t j = 0; j < dir_inode->content.dentries.count; j++) {
 			entries[k].dir = i;
 			entries[k].file = j;
 			k++;
@@ -261,6 +275,165 @@ _create_entries(struct fil_iter *iter)
 	iter->data->entries = entries;
 	iter->data->n_entries = n_entries;
 
+	return 0;
+}
+
+static int
+_label_cmp(const void *a, const void *b)
+{
+	return strcmp((const char *)a, (const char *)b);
+}
+
+/* opends backend: enumerate the dataset by walking the mount, following the
+ * mnt/<data_dir>/<label-dir>/<file> layout and recording each file's path and
+ * size. entry.dir is the (sorted) label index and entry.file indexes
+ * opends_recs. */
+static int
+_homi_create_entries(struct fil_iter *iter)
+{
+	const char *mnt = iter->opts->mnt;
+	const char *data_dir = iter->opts->data_dir;
+	char base[PATH_MAX];
+	char (*labels)[NAME_MAX + 1] = NULL;
+	uint32_t n_labels = 0, cap_labels = 0;
+	struct fil_opends_rec *recs = NULL;
+	struct fil_entry *entries = NULL;
+	uint64_t n = 0, cap = 0, max_size = 0, total_size = 0;
+	struct dirent *de;
+	int err;
+	DIR *bd;
+
+	snprintf(base, sizeof(base), "%s/%s", mnt, data_dir);
+
+	bd = opendir(base);
+	if (!bd) {
+		err = errno;
+		fprintf(stderr, "opendir(%s): %d\n", base, err);
+		return err;
+	}
+	while ((de = readdir(bd))) {
+		char sub[PATH_MAX];
+		struct stat st;
+
+		if (de->d_name[0] == '.')
+			continue;
+		snprintf(sub, sizeof(sub), "%s/%s", base, de->d_name);
+		if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode))
+			continue;
+		if (n_labels == cap_labels) {
+			cap_labels = cap_labels ? cap_labels * 2 : 16;
+			void *p = realloc(labels, sizeof(*labels) * cap_labels);
+			if (!p) {
+				free(labels);
+				closedir(bd);
+				return ENOMEM;
+			}
+			labels = p;
+		}
+		snprintf(labels[n_labels], NAME_MAX + 1, "%s", de->d_name);
+		n_labels++;
+	}
+	closedir(bd);
+
+	if (n_labels > 1)
+		qsort(labels, n_labels, sizeof(*labels), _label_cmp);
+
+	for (uint32_t li = 0; li < n_labels; li++) {
+		char dirpath[PATH_MAX];
+		DIR *dd;
+
+		snprintf(dirpath, sizeof(dirpath), "%s/%s", base, labels[li]);
+		dd = opendir(dirpath);
+		if (!dd) {
+			err = errno;
+			fprintf(stderr, "opendir(%s): %d\n", dirpath, err);
+			free(labels);
+			free(recs);
+			free(entries);
+			return err;
+		}
+		while ((de = readdir(dd))) {
+			char fpath[PATH_MAX];
+			struct stat st;
+
+			if (de->d_name[0] == '.')
+				continue;
+			snprintf(fpath, sizeof(fpath), "%s/%s", dirpath, de->d_name);
+			if (stat(fpath, &st) != 0 || !S_ISREG(st.st_mode))
+				continue;
+			if (n == cap) {
+				cap = cap ? cap * 2 : 256;
+				void *pr = realloc(recs, sizeof(*recs) * cap);
+				void *pe = realloc(entries, sizeof(*entries) * cap);
+				if (!pr || !pe) {
+					free(pr ? pr : recs);
+					free(pe ? pe : entries);
+					free(labels);
+					closedir(dd);
+					return ENOMEM;
+				}
+				recs = pr;
+				entries = pe;
+			}
+			snprintf(recs[n].path, sizeof(recs[n].path), "%s", fpath);
+			recs[n].size = (uint64_t)st.st_size;
+			entries[n].dir = li;
+			entries[n].file = n;
+			if (recs[n].size > max_size)
+				max_size = recs[n].size;
+			total_size += recs[n].size;
+			n++;
+		}
+		closedir(dd);
+	}
+	free(labels);
+
+	if (n == 0) {
+		fprintf(stderr, "No files found under %s\n", base);
+		free(recs);
+		free(entries);
+		return ENOENT;
+	}
+
+	iter->data->entries = entries;
+	iter->data->n_entries = n;
+	iter->data->opends_recs = recs;
+	iter->data->n_recs = n;
+
+	iter->stats->n_files = n;
+	iter->stats->max_file_size = max_size;
+	iter->stats->avg_file_size = total_size / n;
+
+	if (!iter->buffer_size) {
+		uint64_t pg = 4096;
+		iter->buffer_size = (1 + ((max_size - 1) / pg)) * pg;
+	}
+
+	return 0;
+}
+
+static int
+_opends_cuda_ctx(void)
+{
+	static CUcontext ctx;
+	CUdevice cudev;
+	CUresult cr;
+
+	cr = cuInit(0);
+	if (cr != CUDA_SUCCESS) {
+		fprintf(stderr, "cuInit: %d\n", cr);
+		return EIO;
+	}
+	cr = cuDeviceGet(&cudev, 0);
+	if (cr != CUDA_SUCCESS) {
+		fprintf(stderr, "cuDeviceGet: %d\n", cr);
+		return EIO;
+	}
+	cr = cuCtxCreate(&ctx, 0, cudev);
+	if (cr != CUDA_SUCCESS) {
+		fprintf(stderr, "cuCtxCreate: %d\n", cr);
+		return EIO;
+	}
 	return 0;
 }
 
@@ -323,6 +496,23 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 					return err;
 				}
 				break;
+			case FIL_OPENDS: {
+				ds_file_error_t derr;
+				err = cudaMalloc(&device->buffers[j], iter->buffer_size);
+				if (err) {
+					fprintf(stderr, "cudaMalloc(buffers[%d]): %d\n", i, err);
+					return err;
+				}
+				derr = ds_file_buf_register(device->buffers[j],
+							    iter->buffer_size, 0);
+				if (derr.err != DS_FILE_SUCCESS) {
+					fprintf(stderr,
+						"ds_file_buf_register(buffers[%d]): %s\n",
+						i, ds_file_op_status_error(derr.err));
+					return derr.err;
+				}
+				break;
+			}
 			}
 			if (!device->buffers[j]) {
 				err = errno;
@@ -369,7 +559,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->async) {
+	if (iter->opts->async && iter->type == FIL_FILE) {
 		iter->gds_io = malloc(sizeof(struct fil_gds_io));
 		if (!iter->gds_io) {
 			err = errno;
@@ -422,13 +612,12 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	iter->data = malloc(sizeof(struct fil_data));
-	if (!iter->data) {
-		err = errno;
-		fprintf(stderr, "Could not allocate data: %d\n", err);
-		return err;
+	if (iter->opts->async && iter->type == FIL_OPENDS) {
+		err = fil_opends_io_alloc(iter);
+		if (err) {
+			return err;
+		}
 	}
-	memset(iter->data, 0, sizeof(struct fil_data));
 
 	return 0;
 }
@@ -452,10 +641,22 @@ fil_term(struct fil_iter *iter)
 				cudaFree(device->buffers[j]);
 			}
 			break;
+		case FIL_OPENDS:
+			for (uint32_t j = 0; j < device->n_buffers; j++) {
+				ds_file_buf_deregister(device->buffers[j]);
+				cudaFree(device->buffers[j]);
+			}
+			break;
 		}
-		xal_close(device->xal);
-		xnvme_dev_close(device->dev);
-		cuFileDriverClose();
+		if (device->xal) {
+			xal_close(device->xal);
+		}
+		if (device->dev) {
+			xnvme_dev_close(device->dev);
+		}
+		if (iter->type != FIL_OPENDS) {
+			cuFileDriverClose();
+		}
 		if (device->cpu_io) {
 			free(device->cpu_io->slbas);
 			free(device->cpu_io->elbas);
@@ -466,6 +667,10 @@ fil_term(struct fil_iter *iter)
 		}
 		free(device->buffers);
 		free(device);
+	}
+	fil_opends_io_free(iter);
+	if (iter->type == FIL_OPENDS) {
+		ds_file_driver_close();
 	}
 	if (iter->gds_io) {
 		free(iter->gds_io->descr);
@@ -479,6 +684,7 @@ fil_term(struct fil_iter *iter)
 	}
 	if (iter->data) {
 		free(iter->data->entries);
+		free(iter->data->opends_recs);
 		free(iter->data);
 	}
 	free(iter->opts);
@@ -524,8 +730,16 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->async && strcmp(opts->backend, "gds") != 0) {
-		fprintf(stderr, "opts->async == true is only compatible with GDS backend");
+	if (opts->async && strcmp(opts->backend, "gds") != 0
+			&& strcmp(opts->backend, "opends") != 0) {
+		fprintf(stderr,
+			"opts->async is only compatible with gds or opends backends\n");
+		return EINVAL;
+	}
+
+	if (strcmp(opts->backend, "opends") == 0 && n_devs != 1) {
+		fprintf(stderr, "opends backend supports a single device only (got %u)\n",
+			n_devs);
 		return EINVAL;
 	}
 
@@ -559,6 +773,12 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return err;
 	}
 
+	if (opts->data_dir[0] == '\0') {
+		fprintf(stderr, "data_dir is required\n");
+		fil_term(_iter);
+		return EINVAL;
+	}
+
 	for (uint32_t i = 0; i < n_devs; i++) {
 		struct fil_dev *device = malloc(sizeof(struct fil_dev));
 		if (!device) {
@@ -569,16 +789,24 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		}
 		memset(device, 0, sizeof(struct fil_dev));
 
-		err = _xnvme_setup(_iter, device, dev_uris[i]);
-		if (err) {
-			fprintf(stderr, "xNVMe setup failed for %s: %d\n", dev_uris[i], err);
-			fil_term(_iter);
-			return err;
-		}
-		if (_iter->opts->data_dir[0] != '\0') {
+		if (strcmp(opts->backend, "opends") == 0) {
+			/* The opends backend reads through the OpenDS file API, so
+			 * enumerate the dataset by readdir on the mount rather than
+			 * opening the device or walking xal. */
+			_iter->type = FIL_OPENDS;
+			device->data_dir = opts->data_dir;
+		} else {
+			err = _xnvme_setup(_iter, device, dev_uris[i]);
+			if (err) {
+				fprintf(stderr, "xNVMe setup failed for %s: %d\n", dev_uris[i],
+					err);
+				fil_term(_iter);
+				return err;
+			}
 			err = _xal_setup(_iter, device);
 			if (err) {
-				fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
+				fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i],
+					err);
 				xnvme_dev_close(device->dev);
 				fil_term(_iter);
 				return err;
@@ -588,44 +816,73 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		_iter->n_devs++;
 	}
 
-	if (_iter->opts->data_dir[0] != '\0') {
-		err = _alloc(_iter, _iter->opts->batch_size);
-		if (err) {
-			fil_term(_iter);
-			return err;
-		}
-		switch (_iter->type) {
-		case FIL_GPU:
-			_iter->io_fn = fil_gpu_submit;
-			break;
-		case FIL_CPU:
-			_iter->io_fn = fil_cpu_submit;
-			break;
-		case FIL_FILE:
-			if (_iter->opts->async) {
-				_iter->io_fn = fil_gds_async_submit;
-			} else {
-				_iter->io_fn = fil_file_submit;
-			}
-			_find_prefix(_iter);
-			break;
-		}
-
-		// Create an entry for every file in every directory
-		err = _create_entries(_iter);
-		if (err) {
-			fil_term(_iter);
-			return err;
-		}
-
-		FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
-			    uint64_t);
-
-	} else {
-		fprintf(stderr, "data_dir is required\n");
+	_iter->data = calloc(1, sizeof(struct fil_data));
+	if (!_iter->data) {
+		err = errno;
+		fprintf(stderr, "Could not allocate data: %d\n", err);
 		fil_term(_iter);
-		return EINVAL;
+		return err;
 	}
+
+	if (_iter->type == FIL_OPENDS) {
+		/* The upcie-cuda backend DMAs into GPU memory, so a driver-API
+		 * CUDA context must be current before ds_file_driver_open. */
+		err = _opends_cuda_ctx();
+		if (err) {
+			fil_term(_iter);
+			return err;
+		}
+		ds_file_error_t derr = ds_file_driver_open();
+		if (derr.err != DS_FILE_SUCCESS) {
+			fprintf(stderr, "ds_file_driver_open: %s\n",
+				ds_file_op_status_error(derr.err));
+			fil_term(_iter);
+			return derr.err;
+		}
+	}
+
+	// Create an entry for every file in every directory.
+	if (_iter->type == FIL_OPENDS) {
+		err = _homi_create_entries(_iter);
+	} else {
+		err = _create_entries(_iter);
+	}
+	if (err) {
+		fil_term(_iter);
+		return err;
+	}
+
+	err = _alloc(_iter, _iter->opts->batch_size);
+	if (err) {
+		fil_term(_iter);
+		return err;
+	}
+	switch (_iter->type) {
+	case FIL_GPU:
+		_iter->io_fn = fil_gpu_submit;
+		break;
+	case FIL_CPU:
+		_iter->io_fn = fil_cpu_submit;
+		break;
+	case FIL_FILE:
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_gds_async_submit;
+		} else {
+			_iter->io_fn = fil_file_submit;
+		}
+		_find_prefix(_iter);
+		break;
+	case FIL_OPENDS:
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_opends_async_submit;
+		} else {
+			_iter->io_fn = fil_opends_submit;
+		}
+		break;
+	}
+
+	FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
+		    uint64_t);
 
 	(*iter) = _iter;
 

@@ -168,9 +168,12 @@ fil_cpu_submit(struct fil_iter *iter)
 		for (uint32_t j = 0; j < device->n_buffers; j++) {
 			entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
 
-			dir = device->root_inode->content.dentries.inodes[entry.dir];
-			file = dir.content.dentries.inodes[entry.file];
-			extent = file.content.extents.extent[0];
+			dir = *xal_inode_at(device->xal,
+					    device->root_inode->content.dentries.inodes_idx +
+						entry.dir);
+			file = *xal_inode_at(device->xal,
+					     dir.content.dentries.inodes_idx + entry.file);
+			extent = *xal_extent_at(device->xal, file.content.extents.extent_idx);
 			device->cpu_io->slbas[j] =
 			    xal_fsbno_offset(device->xal, extent.start_block) / blocksize;
 
@@ -180,7 +183,8 @@ fil_cpu_submit(struct fil_iter *iter)
 			iter->output->labels[j + i * device->n_buffers] = entry.dir;
 
 			for (uint32_t k = 1; k < file.content.extents.count; k++) {
-				next_extent = file.content.extents.extent[k];
+				next_extent = *xal_extent_at(device->xal,
+							     file.content.extents.extent_idx + k);
 				next_slba = xal_fsbno_offset(device->xal, next_extent.start_block) /
 					    blocksize;
 				if (next_slba != device->cpu_io->slbas[j] + nblocks) {
@@ -259,8 +263,10 @@ fil_file_submit(struct fil_iter *iter)
 		xal_blksize = xal_get_sb_blocksize(device->xal);
 
 		entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
-		dir = device->root_inode->content.dentries.inodes[entry.dir];
-		file = dir.content.dentries.inodes[entry.file];
+		dir = *xal_inode_at(device->xal,
+				    device->root_inode->content.dentries.inodes_idx + entry.dir);
+		file = *xal_inode_at(device->xal,
+				     dir.content.dentries.inodes_idx + entry.file);
 
 		iter->output->buf_len[buf_id + dev_id * device->n_buffers] = file.size;
 		iter->output->labels[buf_id + dev_id * device->n_buffers] = entry.dir;
@@ -377,8 +383,10 @@ fil_gds_async_submit(struct fil_iter *iter)
 		path = device->file_io->path;
 
 		entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
-		dir = device->root_inode->content.dentries.inodes[entry.dir];
-		file = dir.content.dentries.inodes[entry.file];
+		dir = *xal_inode_at(device->xal,
+				    device->root_inode->content.dentries.inodes_idx + entry.dir);
+		file = *xal_inode_at(device->xal,
+				     dir.content.dentries.inodes_idx + entry.file);
 
 		iter->output->buf_len[buf_id + dev_id * device->n_buffers] = file.size;
 		iter->output->labels[buf_id + dev_id * device->n_buffers] = entry.dir;

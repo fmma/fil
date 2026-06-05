@@ -3,18 +3,31 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <ds_file.h>
 #include <limits.h>
 #include <stdint.h>
+
+struct fil_iter;
+struct xal_inode;
 
 struct fil_entry {
 	uint64_t dir;
 	uint64_t file;
 };
 
+/* opends backend: a file on the mounted filesystem, enumerated by readdir;
+ * only the path and size are needed. entry.file indexes opends_recs. */
+struct fil_opends_rec {
+	char path[PATH_MAX];
+	uint64_t size;
+};
+
 struct fil_data {
 	struct fil_entry *entries;
 	uint64_t n_entries;
 	uint64_t index;
+	struct fil_opends_rec *opends_recs;
+	uint64_t n_recs;
 };
 
 struct fil_cpu_io {
@@ -36,6 +49,14 @@ struct fil_gds_io {
 	cudaStream_t *streams;
 };
 
+struct fil_opends_io {
+	ds_file_handle_t *handles;
+	int *fds;
+	size_t *expected;
+	ssize_t *actual;
+	cudaStream_t *streams;
+};
+
 int
 fil_cpu_submit(struct fil_iter *iter);
 
@@ -47,5 +68,17 @@ fil_file_submit(struct fil_iter *iter);
 
 int
 fil_gds_async_submit(struct fil_iter *iter);
+
+int
+fil_opends_submit(struct fil_iter *iter);
+
+int
+fil_opends_async_submit(struct fil_iter *iter);
+
+int
+fil_opends_io_alloc(struct fil_iter *iter);
+
+void
+fil_opends_io_free(struct fil_iter *iter);
 
 #endif

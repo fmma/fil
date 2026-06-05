@@ -23,7 +23,7 @@ print_help(const char *name)
 	fprintf(stderr, "\t \t \t | \t The data-dir should be a name of a directory, not a path\n");
 	fprintf(stderr, "\t \t \t | \t The name of the data-dir should be unique\n");
 	fprintf(stderr, "\t --backend \t | \t The backend to use for reading files (aisio-cpu "
-			"[default], aisio-gpu, posix, gds)\n");
+			"[default], aisio-gpu, posix, gds, opends)\n");
 	fprintf(stderr, "\t --mnt \t \t | \t The mountpoint of the drive (default = /mnt). Only "
 			"relevant for backends: 'posix' and 'gds'\n");
 	fprintf(stderr, "\t --iosize \t | \t The number of bytes per I/O (default = 4096). Only relevant for backends: 'aisio-cpu' and 'aisio-gpu'\n");
@@ -36,7 +36,7 @@ print_help(const char *name)
 		"\t --batch-size \t | \t The number of files to read per batch (default = 1)\n");
 	fprintf(stderr, "\t --batches \t | \t The number of batches to read (default = 1)\n");
 	fprintf(stderr, "\t --buffered \t | \t Don't open with O_DIRECT when using POSIX\n");
-	fprintf(stderr, "\t --async \t | \t Use the async API when using GDS\n");
+	fprintf(stderr, "\t --async \t | \t Use the async API (gds, opends backends)\n");
 	fprintf(stderr, "\t --summary \t | \t Print IO and dataset stats\n");
 	fprintf(stderr, "\t --help \t | \t Print this message\n");
 }
@@ -200,10 +200,6 @@ main(int argc, char *argv[])
 		printf("\tTotal time: %lf\n", elapsed);
 		printf("\tPrep time: %lf\n", stats->prep_time);
 		printf("\tIO time: %lf\n", stats->io_time);
-		if (opts.data_dir[0] == '\0') {
-			printf("\t -- SYNTHETIC NUMBERS EXCLUDING PREP TIME -- \n");
-			time = stats->io_time;
-		}
 		printf("\tFile/s: %lf\n", (args.batches * opts.batch_size) / elapsed);
 		printf("\tMiB/s: %lf\n", (stats->bytes / 1024.f / 1024.f) / elapsed);
 		printf("\tIOPS: %lf\n", stats->io / elapsed);
