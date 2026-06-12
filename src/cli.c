@@ -25,7 +25,7 @@ print_help(const char *name)
 	fprintf(stderr, "\t --backend \t | \t The backend to use for reading files (aisio-cpu "
 			"[default], aisio-gpu, posix, gds, opends)\n");
 	fprintf(stderr, "\t --mnt \t \t | \t The mountpoint of the drive (default = /mnt). Only "
-			"relevant for backends: 'posix' and 'gds'\n");
+			"relevant for backends: 'posix', 'gds' and 'opends'\n");
 	fprintf(stderr, "\t --iosize \t | \t The number of bytes per I/O (default = 4096). Only relevant for backends: 'aisio-cpu' and 'aisio-gpu'\n");
 	fprintf(stderr, "\t --gpu-nqueues \t | \t The number of GPU queues to create (default = "
 			"128). Only relevant for backend: 'aisio-gpu'\n");

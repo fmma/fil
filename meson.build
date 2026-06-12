@@ -52,7 +52,6 @@ public_headers = files(
 sources = files(
   'src/iter.c',
   'src/io.c',
-  'src/opends.c',
 )
 
 include_dirs = include_directories('include')

@@ -1,9 +1,7 @@
-#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/stat.h>
 
 #include <libfil.h>
 #include <fil_io.h>
@@ -71,7 +69,10 @@ _xnvme_setup(struct fil_iter *iter, struct fil_dev *device, const char *uri)
 			return status.err;
 		}
 	} else if (strcmp(backend, "opends") == 0) {
-		opts.be = "upcie";
+		/* Enumerate by walking xal on the qublk-exported block device,
+		 * exactly like gds walks the kernel-bound NVMe; the OpenDS file
+		 * API drives the reads. */
+		opts.be = "linux";
 		iter->type = FIL_OPENDS;
 	} else {
 		fprintf(stderr, "Invalid backend: %s\n", backend);
@@ -279,140 +280,6 @@ _create_entries(struct fil_iter *iter)
 }
 
 static int
-_label_cmp(const void *a, const void *b)
-{
-	return strcmp((const char *)a, (const char *)b);
-}
-
-/* opends backend: enumerate the dataset by walking the mount, following the
- * mnt/<data_dir>/<label-dir>/<file> layout and recording each file's path and
- * size. entry.dir is the (sorted) label index and entry.file indexes
- * opends_recs. */
-static int
-_homi_create_entries(struct fil_iter *iter)
-{
-	const char *mnt = iter->opts->mnt;
-	const char *data_dir = iter->opts->data_dir;
-	char base[PATH_MAX];
-	char (*labels)[NAME_MAX + 1] = NULL;
-	uint32_t n_labels = 0, cap_labels = 0;
-	struct fil_opends_rec *recs = NULL;
-	struct fil_entry *entries = NULL;
-	uint64_t n = 0, cap = 0, max_size = 0, total_size = 0;
-	struct dirent *de;
-	int err;
-	DIR *bd;
-
-	snprintf(base, sizeof(base), "%s/%s", mnt, data_dir);
-
-	bd = opendir(base);
-	if (!bd) {
-		err = errno;
-		fprintf(stderr, "opendir(%s): %d\n", base, err);
-		return err;
-	}
-	while ((de = readdir(bd))) {
-		char sub[PATH_MAX];
-		struct stat st;
-
-		if (de->d_name[0] == '.')
-			continue;
-		snprintf(sub, sizeof(sub), "%s/%s", base, de->d_name);
-		if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode))
-			continue;
-		if (n_labels == cap_labels) {
-			cap_labels = cap_labels ? cap_labels * 2 : 16;
-			void *p = realloc(labels, sizeof(*labels) * cap_labels);
-			if (!p) {
-				free(labels);
-				closedir(bd);
-				return ENOMEM;
-			}
-			labels = p;
-		}
-		snprintf(labels[n_labels], NAME_MAX + 1, "%s", de->d_name);
-		n_labels++;
-	}
-	closedir(bd);
-
-	if (n_labels > 1)
-		qsort(labels, n_labels, sizeof(*labels), _label_cmp);
-
-	for (uint32_t li = 0; li < n_labels; li++) {
-		char dirpath[PATH_MAX];
-		DIR *dd;
-
-		snprintf(dirpath, sizeof(dirpath), "%s/%s", base, labels[li]);
-		dd = opendir(dirpath);
-		if (!dd) {
-			err = errno;
-			fprintf(stderr, "opendir(%s): %d\n", dirpath, err);
-			free(labels);
-			free(recs);
-			free(entries);
-			return err;
-		}
-		while ((de = readdir(dd))) {
-			char fpath[PATH_MAX];
-			struct stat st;
-
-			if (de->d_name[0] == '.')
-				continue;
-			snprintf(fpath, sizeof(fpath), "%s/%s", dirpath, de->d_name);
-			if (stat(fpath, &st) != 0 || !S_ISREG(st.st_mode))
-				continue;
-			if (n == cap) {
-				cap = cap ? cap * 2 : 256;
-				void *pr = realloc(recs, sizeof(*recs) * cap);
-				void *pe = realloc(entries, sizeof(*entries) * cap);
-				if (!pr || !pe) {
-					free(pr ? pr : recs);
-					free(pe ? pe : entries);
-					free(labels);
-					closedir(dd);
-					return ENOMEM;
-				}
-				recs = pr;
-				entries = pe;
-			}
-			snprintf(recs[n].path, sizeof(recs[n].path), "%s", fpath);
-			recs[n].size = (uint64_t)st.st_size;
-			entries[n].dir = li;
-			entries[n].file = n;
-			if (recs[n].size > max_size)
-				max_size = recs[n].size;
-			total_size += recs[n].size;
-			n++;
-		}
-		closedir(dd);
-	}
-	free(labels);
-
-	if (n == 0) {
-		fprintf(stderr, "No files found under %s\n", base);
-		free(recs);
-		free(entries);
-		return ENOENT;
-	}
-
-	iter->data->entries = entries;
-	iter->data->n_entries = n;
-	iter->data->opends_recs = recs;
-	iter->data->n_recs = n;
-
-	iter->stats->n_files = n;
-	iter->stats->max_file_size = max_size;
-	iter->stats->avg_file_size = total_size / n;
-
-	if (!iter->buffer_size) {
-		uint64_t pg = 4096;
-		iter->buffer_size = (1 + ((max_size - 1) / pg)) * pg;
-	}
-
-	return 0;
-}
-
-static int
 _opends_cuda_ctx(void)
 {
 	static CUcontext ctx;
@@ -543,18 +410,24 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 				fprintf(stderr, "Could not allocate array for elbas: %d\n", err);
 				return err;
 			}
-		} else if (iter->type == FIL_FILE) {
+		} else if (iter->type == FIL_FILE || iter->type == FIL_OPENDS) {
 			device->file_io = malloc(sizeof(struct fil_file_io));
 			if (!device->file_io) {
 				err = errno;
 				fprintf(stderr, "Could not allocate IO struct: %d\n", err);
 				return err;
 			}
-			device->file_io->buffer = malloc(iter->buffer_size);
-			if (!device->file_io->buffer) {
-				err = errno;
-				fprintf(stderr, "Could not allocate bounce buffer: %d\n", err);
-				return err;
+			/* opends reads straight into GPU memory, so no host bounce. */
+			if (iter->type == FIL_OPENDS) {
+				device->file_io->buffer = NULL;
+			} else {
+				device->file_io->buffer = malloc(iter->buffer_size);
+				if (!device->file_io->buffer) {
+					err = errno;
+					fprintf(stderr, "Could not allocate bounce buffer: %d\n",
+						err);
+					return err;
+				}
 			}
 		}
 	}
@@ -613,9 +486,62 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 	}
 
 	if (iter->opts->async && iter->type == FIL_OPENDS) {
-		err = fil_opends_io_alloc(iter);
-		if (err) {
+		iter->opends_io = calloc(1, sizeof(struct fil_opends_io));
+		if (!iter->opends_io) {
+			err = errno;
+			fprintf(stderr, "Could not allocate OpenDS IO struct: %d\n", err);
 			return err;
+		}
+
+		iter->opends_io->handles = malloc(sizeof(ds_file_handle_t) * iter->opts->batch_size);
+		if (!iter->opends_io->handles) {
+			err = errno;
+			fprintf(stderr, "Could not allocate ds_file handles: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->fds = malloc(sizeof(int) * iter->opts->batch_size);
+		if (!iter->opends_io->fds) {
+			err = errno;
+			fprintf(stderr, "Could not allocate fd array: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->expected = malloc(sizeof(size_t) * iter->opts->batch_size);
+		if (!iter->opends_io->expected) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of expected values: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->actual = malloc(sizeof(ssize_t) * iter->opts->batch_size);
+		if (!iter->opends_io->actual) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of actual values: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->streams = calloc(iter->opts->batch_size, sizeof(cudaStream_t));
+		if (!iter->opends_io->streams) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of CUDA Streams: %d\n", err);
+			return err;
+		}
+
+		for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+			err = cudaStreamCreateWithFlags(&iter->opends_io->streams[i],
+							cudaStreamNonBlocking);
+			if (err) {
+				fprintf(stderr, "Could not setup CUDA Stream, err: %d\n", err);
+				return err;
+			}
+			ds_file_error_t derr =
+				ds_file_stream_register(iter->opends_io->streams[i], 0);
+			if (derr.err != DS_FILE_SUCCESS) {
+				fprintf(stderr, "ds_file_stream_register: %s\n",
+					ds_file_op_status_error(derr.err));
+				return derr.err;
+			}
 		}
 	}
 
@@ -668,10 +594,6 @@ fil_term(struct fil_iter *iter)
 		free(device->buffers);
 		free(device);
 	}
-	fil_opends_io_free(iter);
-	if (iter->type == FIL_OPENDS) {
-		ds_file_driver_close();
-	}
 	if (iter->gds_io) {
 		free(iter->gds_io->descr);
 		free(iter->gds_io->handle);
@@ -682,9 +604,29 @@ fil_term(struct fil_iter *iter)
 		}
 		free(iter->gds_io->streams);
 	}
+	if (iter->opends_io) {
+		free(iter->opends_io->handles);
+		free(iter->opends_io->fds);
+		free(iter->opends_io->expected);
+		free(iter->opends_io->actual);
+		if (iter->opends_io->streams) {
+			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+				if (!iter->opends_io->streams[i])
+					continue;
+				ds_file_stream_deregister(iter->opends_io->streams[i]);
+				cudaStreamDestroy(iter->opends_io->streams[i]);
+			}
+			free(iter->opends_io->streams);
+		}
+	}
+	/* Close the driver only after its registered streams are torn down: the
+	 * streams live in the aisio backend's CUDA context, which driver-close
+	 * destroys, so destroying them afterwards faults. */
+	if (iter->type == FIL_OPENDS) {
+		ds_file_driver_close();
+	}
 	if (iter->data) {
 		free(iter->data->entries);
-		free(iter->data->opends_recs);
 		free(iter->data);
 	}
 	free(iter->opts);
@@ -789,28 +731,18 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		}
 		memset(device, 0, sizeof(struct fil_dev));
 
-		if (strcmp(opts->backend, "opends") == 0) {
-			/* The opends backend reads through the OpenDS file API, so
-			 * enumerate the dataset by readdir on the mount rather than
-			 * opening the device or walking xal. */
-			_iter->type = FIL_OPENDS;
-			device->data_dir = opts->data_dir;
-		} else {
-			err = _xnvme_setup(_iter, device, dev_uris[i]);
-			if (err) {
-				fprintf(stderr, "xNVMe setup failed for %s: %d\n", dev_uris[i],
-					err);
-				fil_term(_iter);
-				return err;
-			}
-			err = _xal_setup(_iter, device);
-			if (err) {
-				fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i],
-					err);
-				xnvme_dev_close(device->dev);
-				fil_term(_iter);
-				return err;
-			}
+		err = _xnvme_setup(_iter, device, dev_uris[i]);
+		if (err) {
+			fprintf(stderr, "xNVMe setup failed for %s: %d\n", dev_uris[i], err);
+			fil_term(_iter);
+			return err;
+		}
+		err = _xal_setup(_iter, device);
+		if (err) {
+			fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
+			xnvme_dev_close(device->dev);
+			fil_term(_iter);
+			return err;
 		}
 		_iter->devs[i] = device;
 		_iter->n_devs++;
@@ -842,11 +774,7 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 	}
 
 	// Create an entry for every file in every directory.
-	if (_iter->type == FIL_OPENDS) {
-		err = _homi_create_entries(_iter);
-	} else {
-		err = _create_entries(_iter);
-	}
+	err = _create_entries(_iter);
 	if (err) {
 		fil_term(_iter);
 		return err;
@@ -876,8 +804,9 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		if (_iter->opts->async) {
 			_iter->io_fn = fil_opends_async_submit;
 		} else {
-			_iter->io_fn = fil_opends_submit;
+			_iter->io_fn = fil_file_submit;
 		}
+		_find_prefix(_iter);
 		break;
 	}
 

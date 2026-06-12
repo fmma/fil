@@ -15,19 +15,10 @@ struct fil_entry {
 	uint64_t file;
 };
 
-/* opends backend: a file on the mounted filesystem, enumerated by readdir;
- * only the path and size are needed. entry.file indexes opends_recs. */
-struct fil_opends_rec {
-	char path[PATH_MAX];
-	uint64_t size;
-};
-
 struct fil_data {
 	struct fil_entry *entries;
 	uint64_t n_entries;
 	uint64_t index;
-	struct fil_opends_rec *opends_recs;
-	uint64_t n_recs;
 };
 
 struct fil_cpu_io {
@@ -70,15 +61,6 @@ int
 fil_gds_async_submit(struct fil_iter *iter);
 
 int
-fil_opends_submit(struct fil_iter *iter);
-
-int
 fil_opends_async_submit(struct fil_iter *iter);
-
-int
-fil_opends_io_alloc(struct fil_iter *iter);
-
-void
-fil_opends_io_free(struct fil_iter *iter);
 
 #endif
