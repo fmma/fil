@@ -362,6 +362,16 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 						err);
 					return err;
 				}
+				if (strcmp(iter->opts->backend, "gds") == 0) {
+					CUfileError_t fstatus = cuFileBufRegister(
+						device->buffers[j], iter->buffer_size, 0);
+					if (fstatus.err != CU_FILE_SUCCESS) {
+						fprintf(stderr,
+							"cuFileBufRegister(buffers[%d]): %d\n", i,
+							fstatus.err);
+						return fstatus.err;
+					}
+				}
 				break;
 			case FIL_OPENDS: {
 				ds_file_error_t derr;
@@ -564,6 +574,8 @@ fil_term(struct fil_iter *iter)
 			break;
 		case FIL_FILE:
 			for (uint32_t j = 0; j < device->n_buffers; j++) {
+				if (strcmp(iter->opts->backend, "gds") == 0)
+					cuFileBufDeregister(device->buffers[j]);
 				cudaFree(device->buffers[j]);
 			}
 			break;
