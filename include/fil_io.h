@@ -3,7 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
-#include <ds_file.h>
+#include <opends.h>
 #include <limits.h>
 #include <stdint.h>
 
@@ -41,7 +41,7 @@ struct fil_gds_io {
 };
 
 struct fil_opends_io {
-	ds_file_handle_t *handles;
+	opends_handle_t *handles;
 	int *fds;
 	size_t *expected;
 	ssize_t *actual;

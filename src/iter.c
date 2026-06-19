@@ -11,8 +11,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cufile.h>
-#include <ds_file.h>
-#include <ds_file_async.h>
+#include <opends.h>
 #include <libxal.h>
 #include <libxnvme.h>
 
@@ -374,18 +373,18 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 				}
 				break;
 			case FIL_OPENDS: {
-				ds_file_error_t derr;
+				opends_error_t derr;
 				err = cudaMalloc(&device->buffers[j], iter->buffer_size);
 				if (err) {
 					fprintf(stderr, "cudaMalloc(buffers[%d]): %d\n", i, err);
 					return err;
 				}
-				derr = ds_file_buf_register(device->buffers[j],
+				derr = opends_buf_register(device->buffers[j],
 							    iter->buffer_size, 0);
-				if (derr.err != DS_FILE_SUCCESS) {
+				if (derr.err != OPENDS_SUCCESS) {
 					fprintf(stderr,
-						"ds_file_buf_register(buffers[%d]): %s\n",
-						i, ds_file_op_status_error(derr.err));
+						"opends_buf_register(buffers[%d]): %s\n",
+						i, opends_op_status_error(derr.err));
 					return derr.err;
 				}
 				break;
@@ -503,10 +502,10 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 			return err;
 		}
 
-		iter->opends_io->handles = malloc(sizeof(ds_file_handle_t) * iter->opts->batch_size);
+		iter->opends_io->handles = malloc(sizeof(opends_handle_t) * iter->opts->batch_size);
 		if (!iter->opends_io->handles) {
 			err = errno;
-			fprintf(stderr, "Could not allocate ds_file handles: %d\n", err);
+			fprintf(stderr, "Could not allocate opends handles: %d\n", err);
 			return err;
 		}
 
@@ -545,11 +544,11 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 				fprintf(stderr, "Could not setup CUDA Stream, err: %d\n", err);
 				return err;
 			}
-			ds_file_error_t derr =
-				ds_file_stream_register(iter->opends_io->streams[i], 0);
-			if (derr.err != DS_FILE_SUCCESS) {
-				fprintf(stderr, "ds_file_stream_register: %s\n",
-					ds_file_op_status_error(derr.err));
+			opends_error_t derr =
+				opends_stream_register(iter->opends_io->streams[i], 0);
+			if (derr.err != OPENDS_SUCCESS) {
+				fprintf(stderr, "opends_stream_register: %s\n",
+					opends_op_status_error(derr.err));
 				return derr.err;
 			}
 		}
@@ -581,7 +580,7 @@ fil_term(struct fil_iter *iter)
 			break;
 		case FIL_OPENDS:
 			for (uint32_t j = 0; j < device->n_buffers; j++) {
-				ds_file_buf_deregister(device->buffers[j]);
+				opends_buf_deregister(device->buffers[j]);
 				cudaFree(device->buffers[j]);
 			}
 			break;
@@ -625,7 +624,7 @@ fil_term(struct fil_iter *iter)
 			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 				if (!iter->opends_io->streams[i])
 					continue;
-				ds_file_stream_deregister(iter->opends_io->streams[i]);
+				opends_stream_deregister(iter->opends_io->streams[i]);
 				cudaStreamDestroy(iter->opends_io->streams[i]);
 			}
 			free(iter->opends_io->streams);
@@ -635,7 +634,7 @@ fil_term(struct fil_iter *iter)
 	 * streams live in the aisio backend's CUDA context, which driver-close
 	 * destroys, so destroying them afterwards faults. */
 	if (iter->type == FIL_OPENDS) {
-		ds_file_driver_close();
+		opends_driver_close();
 	}
 	if (iter->data) {
 		free(iter->data->entries);
@@ -770,16 +769,16 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 
 	if (_iter->type == FIL_OPENDS) {
 		/* The upcie-cuda backend DMAs into GPU memory, so a driver-API
-		 * CUDA context must be current before ds_file_driver_open. */
+		 * CUDA context must be current before opends_driver_open. */
 		err = _opends_cuda_ctx();
 		if (err) {
 			fil_term(_iter);
 			return err;
 		}
-		ds_file_error_t derr = ds_file_driver_open();
-		if (derr.err != DS_FILE_SUCCESS) {
-			fprintf(stderr, "ds_file_driver_open: %s\n",
-				ds_file_op_status_error(derr.err));
+		opends_error_t derr = opends_driver_open();
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "opends_driver_open: %s\n",
+				opends_op_status_error(derr.err));
 			fil_term(_iter);
 			return derr.err;
 		}

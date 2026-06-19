@@ -20,8 +20,7 @@
 #include <cuda_runtime.h>
 #include <cufile.h>
 
-#include <ds_file.h>
-#include <ds_file_async.h>
+#include <opends.h>
 
 #define GPU_WARPSIZE 32
 
@@ -242,8 +241,8 @@ fil_file_submit(struct fil_iter *iter)
 	CUfileError_t status;
 	CUfileDescr_t descr;
 	CUfileHandle_t fh;
-	ds_file_handle_t dfh;
-	ds_file_error_t derr;
+	opends_handle_t dfh;
+	opends_error_t derr;
 	uint32_t buf_id, dev_id, xal_blksize;
 	uint64_t nbytes;
 	void *buffer, *bounce;
@@ -309,10 +308,10 @@ fil_file_submit(struct fil_iter *iter)
 				return status.err;
 			}
 		} else if (is_opends) {
-			derr = ds_file_handle_register(&dfh, fd);
-			if (derr.err != DS_FILE_SUCCESS) {
+			derr = opends_handle_register(&dfh, fd);
+			if (derr.err != OPENDS_SUCCESS) {
 				fprintf(stderr, "Could not register file, err: %s\n",
-					ds_file_op_status_error(derr.err));
+					opends_op_status_error(derr.err));
 				close(fd);
 				return derr.err;
 			}
@@ -340,12 +339,12 @@ fil_file_submit(struct fil_iter *iter)
 			}
 			cuFileHandleDeregister(fh);
 		} else if (is_opends) {
-			bytes_read = ds_file_read(dfh, buffer, nbytes, 0, 0);
-			ds_file_handle_deregister(dfh);
+			bytes_read = opends_read(dfh, buffer, nbytes, 0, 0);
+			opends_handle_deregister(dfh);
 			if (bytes_read < 0) {
 				fprintf(stderr, "Could not read %s, err: %s\n", path,
-					ds_file_op_status_error(
-						(ds_file_op_error_t)(-bytes_read)));
+					opends_op_status_error(
+						(opends_op_error_t)(-bytes_read)));
 				return EIO;
 			}
 			if ((uint64_t)bytes_read != nbytes) {
@@ -502,7 +501,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 	struct xal_inode file;
 	struct timespec start, end;
 	struct fil_opends_io *io = iter->opends_io;
-	ds_file_error_t derr;
+	opends_error_t derr;
 	uint32_t buf_id, dev_id, nsub = 0;
 	void *buffer;
 	char *prefix, *path;
@@ -543,10 +542,10 @@ fil_opends_async_submit(struct fil_iter *iter)
 			goto teardown;
 		}
 
-		derr = ds_file_handle_register(&io->handles[i], io->fds[i]);
-		if (derr.err != DS_FILE_SUCCESS) {
+		derr = opends_handle_register(&io->handles[i], io->fds[i]);
+		if (derr.err != OPENDS_SUCCESS) {
 			fprintf(stderr, "Could not register file, err: %s\n",
-				ds_file_op_status_error(derr.err));
+				opends_op_status_error(derr.err));
 			close(io->fds[i]);
 			err = derr.err;
 			goto teardown;
@@ -556,11 +555,11 @@ fil_opends_async_submit(struct fil_iter *iter)
 		io->actual[i] = 0;
 		nsub = i + 1;
 
-		derr = ds_file_read_async(io->handles[i], buffer, &io->expected[i], &offset,
+		derr = opends_read_async(io->handles[i], buffer, &io->expected[i], &offset,
 					  &offset, &io->actual[i], io->streams[i]);
-		if (derr.err != DS_FILE_SUCCESS) {
-			fprintf(stderr, "ds_file_read_async failed, err: %s\n",
-				ds_file_op_status_error(derr.err));
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "opends_read_async failed, err: %s\n",
+				opends_op_status_error(derr.err));
 			err = derr.err;
 			goto teardown;
 		}
@@ -577,7 +576,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 		}
 		if (io->actual[i] < 0) {
 			fprintf(stderr, "Reading failed, err: %s\n",
-				ds_file_op_status_error((ds_file_op_error_t)(-io->actual[i])));
+				opends_op_status_error((opends_op_error_t)(-io->actual[i])));
 			err = EIO;
 			goto teardown;
 		}
@@ -594,7 +593,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 
 teardown:
 	for (uint32_t i = 0; i < nsub; i++) {
-		ds_file_handle_deregister(io->handles[i]);
+		opends_handle_deregister(io->handles[i]);
 		close(io->fds[i]);
 	}
 	return err;
