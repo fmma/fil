@@ -3,8 +3,12 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <opends.h>
 #include <limits.h>
 #include <stdint.h>
+
+struct fil_iter;
+struct xal_inode;
 
 struct fil_entry {
 	uint64_t dir;
@@ -36,6 +40,14 @@ struct fil_gds_io {
 	cudaStream_t *streams;
 };
 
+struct fil_opends_io {
+	opends_handle_t *handles;
+	int *fds;
+	size_t *expected;
+	ssize_t *actual;
+	cudaStream_t *streams;
+};
+
 int
 fil_cpu_submit(struct fil_iter *iter);
 
@@ -47,5 +59,8 @@ fil_file_submit(struct fil_iter *iter);
 
 int
 fil_gds_async_submit(struct fil_iter *iter);
+
+int
+fil_opends_async_submit(struct fil_iter *iter);
 
 #endif

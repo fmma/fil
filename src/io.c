@@ -20,6 +20,8 @@
 #include <cuda_runtime.h>
 #include <cufile.h>
 
+#include <opends.h>
+
 #define GPU_WARPSIZE 32
 
 #define ELAPSED(s, e) \
@@ -168,9 +170,12 @@ fil_cpu_submit(struct fil_iter *iter)
 		for (uint32_t j = 0; j < device->n_buffers; j++) {
 			entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
 
-			dir = device->root_inode->content.dentries.inodes[entry.dir];
-			file = dir.content.dentries.inodes[entry.file];
-			extent = file.content.extents.extent[0];
+			dir = *xal_inode_at(device->xal,
+					    device->root_inode->content.dentries.inodes_idx +
+						entry.dir);
+			file = *xal_inode_at(device->xal,
+					     dir.content.dentries.inodes_idx + entry.file);
+			extent = *xal_extent_at(device->xal, file.content.extents.extent_idx);
 			device->cpu_io->slbas[j] =
 			    xal_fsbno_offset(device->xal, extent.start_block) / blocksize;
 
@@ -180,7 +185,8 @@ fil_cpu_submit(struct fil_iter *iter)
 			iter->output->labels[j + i * device->n_buffers] = entry.dir;
 
 			for (uint32_t k = 1; k < file.content.extents.count; k++) {
-				next_extent = file.content.extents.extent[k];
+				next_extent = *xal_extent_at(device->xal,
+							     file.content.extents.extent_idx + k);
 				next_slba = xal_fsbno_offset(device->xal, next_extent.start_block) /
 					    blocksize;
 				if (next_slba != device->cpu_io->slbas[j] + nblocks) {
@@ -235,6 +241,8 @@ fil_file_submit(struct fil_iter *iter)
 	CUfileError_t status;
 	CUfileDescr_t descr;
 	CUfileHandle_t fh;
+	opends_handle_t dfh;
+	opends_error_t derr;
 	uint32_t buf_id, dev_id, xal_blksize;
 	uint64_t nbytes;
 	void *buffer, *bounce;
@@ -242,8 +250,9 @@ fil_file_submit(struct fil_iter *iter)
 	int fd, flags;
 	ssize_t err, bytes_read;
 	bool is_gds = strcmp(iter->opts->backend, "gds") == 0;
+	bool is_opends = strcmp(iter->opts->backend, "opends") == 0;
 	flags = O_RDONLY;
-	if (is_gds || !iter->opts->buffered) {
+	if (is_gds || is_opends || !iter->opts->buffered) {
 		flags |= O_DIRECT;
 	}
 
@@ -259,8 +268,10 @@ fil_file_submit(struct fil_iter *iter)
 		xal_blksize = xal_get_sb_blocksize(device->xal);
 
 		entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
-		dir = device->root_inode->content.dentries.inodes[entry.dir];
-		file = dir.content.dentries.inodes[entry.file];
+		dir = *xal_inode_at(device->xal,
+				    device->root_inode->content.dentries.inodes_idx + entry.dir);
+		file = *xal_inode_at(device->xal,
+				     dir.content.dentries.inodes_idx + entry.file);
 
 		iter->output->buf_len[buf_id + dev_id * device->n_buffers] = file.size;
 		iter->output->labels[buf_id + dev_id * device->n_buffers] = entry.dir;
@@ -274,7 +285,7 @@ fil_file_submit(struct fil_iter *iter)
 		strcat(path, file.name);
 
 		nbytes = file.size;
-		if (!is_gds && !iter->opts->buffered) {
+		if (!is_gds && !is_opends && !iter->opts->buffered) {
 			// POSIX O_DIRECT requires aligned nbytes
 			nbytes = (1 + ((file.size - 1) / xal_blksize)) * xal_blksize;
 		}
@@ -295,6 +306,14 @@ fil_file_submit(struct fil_iter *iter)
 				fprintf(stderr, "Could not register file, err: %d\n", status.err);
 				close(fd);
 				return status.err;
+			}
+		} else if (is_opends) {
+			derr = opends_handle_register(&dfh, fd);
+			if (derr.err != OPENDS_SUCCESS) {
+				fprintf(stderr, "Could not register file, err: %s\n",
+					opends_op_status_error(derr.err));
+				close(fd);
+				return derr.err;
 			}
 		}
 
@@ -319,6 +338,22 @@ fil_file_submit(struct fil_iter *iter)
 				return EIO;
 			}
 			cuFileHandleDeregister(fh);
+		} else if (is_opends) {
+			bytes_read = opends_read(dfh, buffer, nbytes, 0, 0);
+			opends_handle_deregister(dfh);
+			if (bytes_read < 0) {
+				fprintf(stderr, "Could not read %s, err: %s\n", path,
+					opends_op_status_error(
+						(opends_op_error_t)(-bytes_read)));
+				return EIO;
+			}
+			if ((uint64_t)bytes_read != nbytes) {
+				fprintf(
+				    stderr,
+				    "Could not read entire file %s, expected: %lu, actual: %ld\n",
+				    path, file.size, bytes_read);
+				return EIO;
+			}
 		} else {
 			do {
 				err = read(fd, bounce, nbytes - bytes_read);
@@ -377,8 +412,10 @@ fil_gds_async_submit(struct fil_iter *iter)
 		path = device->file_io->path;
 
 		entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
-		dir = device->root_inode->content.dentries.inodes[entry.dir];
-		file = dir.content.dentries.inodes[entry.file];
+		dir = *xal_inode_at(device->xal,
+				    device->root_inode->content.dentries.inodes_idx + entry.dir);
+		file = *xal_inode_at(device->xal,
+				     dir.content.dentries.inodes_idx + entry.file);
 
 		iter->output->buf_len[buf_id + dev_id * device->n_buffers] = file.size;
 		iter->output->labels[buf_id + dev_id * device->n_buffers] = entry.dir;
@@ -452,6 +489,112 @@ teardown:
 		fd = gds_io->descr[i].handle.fd;
 		cuFileHandleDeregister(gds_io->handle[i]);
 		close(fd);
+	}
+	return err;
+}
+
+int
+fil_opends_async_submit(struct fil_iter *iter)
+{
+	struct fil_entry entry;
+	struct xal_inode dir;
+	struct xal_inode file;
+	struct timespec start, end;
+	struct fil_opends_io *io = iter->opends_io;
+	opends_error_t derr;
+	uint32_t buf_id, dev_id, nsub = 0;
+	void *buffer;
+	char *prefix, *path;
+	off_t offset = 0;
+	int err = 0;
+	int flags = O_RDONLY | O_DIRECT;
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+		dev_id = i % iter->n_devs;
+		struct fil_dev *device = iter->devs[dev_id];
+		buf_id = device->buf++ % device->n_buffers;
+		buffer = device->buffers[buf_id];
+		prefix = device->file_io->prefix;
+		path = device->file_io->path;
+
+		entry = iter->data->entries[iter->data->index++ % iter->data->n_entries];
+		dir = *xal_inode_at(device->xal,
+				    device->root_inode->content.dentries.inodes_idx + entry.dir);
+		file = *xal_inode_at(device->xal,
+				     dir.content.dentries.inodes_idx + entry.file);
+
+		iter->output->buf_len[buf_id + dev_id * device->n_buffers] = file.size;
+		iter->output->labels[buf_id + dev_id * device->n_buffers] = entry.dir;
+		iter->stats->bytes += file.size;
+		iter->stats->io++;
+
+		memcpy(path, prefix, strlen(prefix) + 1);
+		strcat(path, "/");
+		strcat(path, dir.name);
+		strcat(path, "/");
+		strcat(path, file.name);
+
+		io->fds[i] = open(path, flags);
+		if (io->fds[i] == -1) {
+			err = errno;
+			fprintf(stderr, "Could not open %s, err: %d\n", path, err);
+			goto teardown;
+		}
+
+		derr = opends_handle_register(&io->handles[i], io->fds[i]);
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "Could not register file, err: %s\n",
+				opends_op_status_error(derr.err));
+			close(io->fds[i]);
+			err = derr.err;
+			goto teardown;
+		}
+
+		io->expected[i] = file.size;
+		io->actual[i] = 0;
+		nsub = i + 1;
+
+		derr = opends_read_async(io->handles[i], buffer, &io->expected[i], &offset,
+					  &offset, &io->actual[i], io->streams[i]);
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "opends_read_async failed, err: %s\n",
+				opends_op_status_error(derr.err));
+			err = derr.err;
+			goto teardown;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->prep_time += ELAPSED(start, end);
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+		err = cudaStreamSynchronize(io->streams[i]);
+		if (err) {
+			fprintf(stderr, "Could not synchronize CUDA Stream, err: %d\n", err);
+			goto teardown;
+		}
+		if (io->actual[i] < 0) {
+			fprintf(stderr, "Reading failed, err: %s\n",
+				opends_op_status_error((opends_op_error_t)(-io->actual[i])));
+			err = EIO;
+			goto teardown;
+		}
+		if ((size_t)io->actual[i] != io->expected[i]) {
+			fprintf(stderr,
+				"Could not read entire file, expected: %lu, actual: %ld\n",
+				io->expected[i], io->actual[i]);
+			err = EIO;
+			goto teardown;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->io_time += ELAPSED(start, end);
+
+teardown:
+	for (uint32_t i = 0; i < nsub; i++) {
+		opends_handle_deregister(io->handles[i]);
+		close(io->fds[i]);
 	}
 	return err;
 }

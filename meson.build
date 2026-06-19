@@ -18,7 +18,7 @@ if not cc.has_function('clock_gettime', prefix: '#include <time.h>', dependencie
   error('clock_gettime not found')
 endif
 
-cuda_dep = dependency('cuda', modules: ['cufile'])
+cuda_dep = dependency('cuda', modules: ['cufile', 'cuda'])
 
 xnvme_dep = dependency(
   'xnvme',
@@ -28,7 +28,12 @@ xnvme_dep = dependency(
 
 xal_dep = dependency(
   'xal',
-  version: '0.2.0',
+  version: '>=0.2.0',
+  required: true
+)
+
+opends_aisio_dep = dependency(
+  'opends_aisio',
   required: true
 )
 
@@ -37,6 +42,7 @@ fil_deps = [
   cuda_dep,
   xnvme_dep,
   xal_dep,
+  opends_aisio_dep,
 ]
 
 public_headers = files(

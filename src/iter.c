@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -7,8 +8,10 @@
 #include <fil_iter.h>
 #include <fil_util.h>
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <opends.h>
 #include <libxal.h>
 #include <libxnvme.h>
 
@@ -64,6 +67,12 @@ _xnvme_setup(struct fil_iter *iter, struct fil_dev *device, const char *uri)
 			fprintf(stderr, "Could not open cuFile driver: %d\n", status.err);
 			return status.err;
 		}
+	} else if (strcmp(backend, "opends") == 0) {
+		/* Enumerate by walking xal on the qublk-exported block device,
+		 * exactly like gds walks the kernel-bound NVMe; the OpenDS file
+		 * API drives the reads. */
+		opts.be = "linux";
+		iter->type = FIL_OPENDS;
 	} else {
 		fprintf(stderr, "Invalid backend: %s\n", backend);
 		return EINVAL;
@@ -131,12 +140,12 @@ find_data_dir(struct xal *FIL_UNUSED(xal), struct xal_inode *inode, void *cb_arg
 }
 
 static void
-path_prepend(char *path, struct xal_inode *node)
+path_prepend(struct xal *xal, char *path, struct xal_inode *node)
 {
-	if (node->name[0] == '\0') {
+	if (node->name[0] == '\0' || node->parent_idx == XAL_POOL_IDX_NONE) {
 		return;
 	}
-	path_prepend(path, node->parent);
+	path_prepend(xal, path, xal_inode_at(xal, node->parent_idx));
 	strcat(path, "/");
 	strcat(path, node->name);
 }
@@ -150,7 +159,7 @@ _find_prefix(struct fil_iter *iter)
 		device = iter->devs[i];
 		prefix = device->file_io->prefix;
 		strcpy(prefix, iter->opts->mnt);
-		path_prepend(prefix, device->root_inode);
+		path_prepend(device->xal, prefix, device->root_inode);
 	}
 }
 
@@ -221,7 +230,7 @@ _xal_setup(struct fil_iter *iter, struct fil_dev *device)
 
 	// Sort the directories so we can derive labels
 	if (device->root_inode->content.dentries.count > 1) {
-		qsort(device->root_inode->content.dentries.inodes,
+		qsort(xal_inode_at(xal, device->root_inode->content.dentries.inodes_idx),
 		      device->root_inode->content.dentries.count, sizeof(struct xal_inode),
 		      inode_cmp);
 	}
@@ -233,13 +242,17 @@ static int
 _create_entries(struct fil_iter *iter)
 {
 	struct fil_entry *entries;
-	struct xal_dentries root_dentries = iter->devs[0]->root_inode->content.dentries;
+	struct xal *xal = iter->devs[0]->xal;
+	struct xal_dentries root_dentries;
 	uint64_t n_entries = 0;
 	int err;
 	int k;
 
+	root_dentries = iter->devs[0]->root_inode->content.dentries;
+
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
-		n_entries += root_dentries.inodes[i].content.dentries.count;
+		n_entries += xal_inode_at(xal, root_dentries.inodes_idx + i)
+				 ->content.dentries.count;
 	}
 
 	entries = malloc(sizeof(struct fil_entry) * n_entries);
@@ -251,7 +264,8 @@ _create_entries(struct fil_iter *iter)
 
 	k = 0;
 	for (uint32_t i = 0; i < root_dentries.count; i++) {
-		for (uint32_t j = 0; j < root_dentries.inodes[i].content.dentries.count; j++) {
+		struct xal_inode *dir_inode = xal_inode_at(xal, root_dentries.inodes_idx + i);
+		for (uint32_t j = 0; j < dir_inode->content.dentries.count; j++) {
 			entries[k].dir = i;
 			entries[k].file = j;
 			k++;
@@ -261,6 +275,31 @@ _create_entries(struct fil_iter *iter)
 	iter->data->entries = entries;
 	iter->data->n_entries = n_entries;
 
+	return 0;
+}
+
+static int
+_opends_cuda_ctx(void)
+{
+	static CUcontext ctx;
+	CUdevice cudev;
+	CUresult cr;
+
+	cr = cuInit(0);
+	if (cr != CUDA_SUCCESS) {
+		fprintf(stderr, "cuInit: %d\n", cr);
+		return EIO;
+	}
+	cr = cuDeviceGet(&cudev, 0);
+	if (cr != CUDA_SUCCESS) {
+		fprintf(stderr, "cuDeviceGet: %d\n", cr);
+		return EIO;
+	}
+	cr = cuCtxCreate(&ctx, 0, cudev);
+	if (cr != CUDA_SUCCESS) {
+		fprintf(stderr, "cuCtxCreate: %d\n", cr);
+		return EIO;
+	}
 	return 0;
 }
 
@@ -322,7 +361,34 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 						err);
 					return err;
 				}
+				if (strcmp(iter->opts->backend, "gds") == 0) {
+					CUfileError_t fstatus = cuFileBufRegister(
+						device->buffers[j], iter->buffer_size, 0);
+					if (fstatus.err != CU_FILE_SUCCESS) {
+						fprintf(stderr,
+							"cuFileBufRegister(buffers[%d]): %d\n", i,
+							fstatus.err);
+						return fstatus.err;
+					}
+				}
 				break;
+			case FIL_OPENDS: {
+				opends_error_t derr;
+				err = cudaMalloc(&device->buffers[j], iter->buffer_size);
+				if (err) {
+					fprintf(stderr, "cudaMalloc(buffers[%d]): %d\n", i, err);
+					return err;
+				}
+				derr = opends_buf_register(device->buffers[j],
+							    iter->buffer_size, 0);
+				if (derr.err != OPENDS_SUCCESS) {
+					fprintf(stderr,
+						"opends_buf_register(buffers[%d]): %s\n",
+						i, opends_op_status_error(derr.err));
+					return derr.err;
+				}
+				break;
+			}
 			}
 			if (!device->buffers[j]) {
 				err = errno;
@@ -353,23 +419,29 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 				fprintf(stderr, "Could not allocate array for elbas: %d\n", err);
 				return err;
 			}
-		} else if (iter->type == FIL_FILE) {
+		} else if (iter->type == FIL_FILE || iter->type == FIL_OPENDS) {
 			device->file_io = malloc(sizeof(struct fil_file_io));
 			if (!device->file_io) {
 				err = errno;
 				fprintf(stderr, "Could not allocate IO struct: %d\n", err);
 				return err;
 			}
-			device->file_io->buffer = malloc(iter->buffer_size);
-			if (!device->file_io->buffer) {
-				err = errno;
-				fprintf(stderr, "Could not allocate bounce buffer: %d\n", err);
-				return err;
+			/* opends reads straight into GPU memory, so no host bounce. */
+			if (iter->type == FIL_OPENDS) {
+				device->file_io->buffer = NULL;
+			} else {
+				device->file_io->buffer = malloc(iter->buffer_size);
+				if (!device->file_io->buffer) {
+					err = errno;
+					fprintf(stderr, "Could not allocate bounce buffer: %d\n",
+						err);
+					return err;
+				}
 			}
 		}
 	}
 
-	if (iter->opts->async) {
+	if (iter->opts->async && iter->type == FIL_FILE) {
 		iter->gds_io = malloc(sizeof(struct fil_gds_io));
 		if (!iter->gds_io) {
 			err = errno;
@@ -422,13 +494,65 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	iter->data = malloc(sizeof(struct fil_data));
-	if (!iter->data) {
-		err = errno;
-		fprintf(stderr, "Could not allocate data: %d\n", err);
-		return err;
+	if (iter->opts->async && iter->type == FIL_OPENDS) {
+		iter->opends_io = calloc(1, sizeof(struct fil_opends_io));
+		if (!iter->opends_io) {
+			err = errno;
+			fprintf(stderr, "Could not allocate OpenDS IO struct: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->handles = malloc(sizeof(opends_handle_t) * iter->opts->batch_size);
+		if (!iter->opends_io->handles) {
+			err = errno;
+			fprintf(stderr, "Could not allocate opends handles: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->fds = malloc(sizeof(int) * iter->opts->batch_size);
+		if (!iter->opends_io->fds) {
+			err = errno;
+			fprintf(stderr, "Could not allocate fd array: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->expected = malloc(sizeof(size_t) * iter->opts->batch_size);
+		if (!iter->opends_io->expected) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of expected values: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->actual = malloc(sizeof(ssize_t) * iter->opts->batch_size);
+		if (!iter->opends_io->actual) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of actual values: %d\n", err);
+			return err;
+		}
+
+		iter->opends_io->streams = calloc(iter->opts->batch_size, sizeof(cudaStream_t));
+		if (!iter->opends_io->streams) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of CUDA Streams: %d\n", err);
+			return err;
+		}
+
+		for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+			err = cudaStreamCreateWithFlags(&iter->opends_io->streams[i],
+							cudaStreamNonBlocking);
+			if (err) {
+				fprintf(stderr, "Could not setup CUDA Stream, err: %d\n", err);
+				return err;
+			}
+			opends_error_t derr =
+				opends_stream_register(iter->opends_io->streams[i], 0);
+			if (derr.err != OPENDS_SUCCESS) {
+				fprintf(stderr, "opends_stream_register: %s\n",
+					opends_op_status_error(derr.err));
+				return derr.err;
+			}
+		}
 	}
-	memset(iter->data, 0, sizeof(struct fil_data));
 
 	return 0;
 }
@@ -449,13 +573,27 @@ fil_term(struct fil_iter *iter)
 			break;
 		case FIL_FILE:
 			for (uint32_t j = 0; j < device->n_buffers; j++) {
+				if (strcmp(iter->opts->backend, "gds") == 0)
+					cuFileBufDeregister(device->buffers[j]);
+				cudaFree(device->buffers[j]);
+			}
+			break;
+		case FIL_OPENDS:
+			for (uint32_t j = 0; j < device->n_buffers; j++) {
+				opends_buf_deregister(device->buffers[j]);
 				cudaFree(device->buffers[j]);
 			}
 			break;
 		}
-		xal_close(device->xal);
-		xnvme_dev_close(device->dev);
-		cuFileDriverClose();
+		if (device->xal) {
+			xal_close(device->xal);
+		}
+		if (device->dev) {
+			xnvme_dev_close(device->dev);
+		}
+		if (iter->type != FIL_OPENDS) {
+			cuFileDriverClose();
+		}
 		if (device->cpu_io) {
 			free(device->cpu_io->slbas);
 			free(device->cpu_io->elbas);
@@ -476,6 +614,27 @@ fil_term(struct fil_iter *iter)
 			cudaStreamDestroy(iter->gds_io->streams[i]);
 		}
 		free(iter->gds_io->streams);
+	}
+	if (iter->opends_io) {
+		free(iter->opends_io->handles);
+		free(iter->opends_io->fds);
+		free(iter->opends_io->expected);
+		free(iter->opends_io->actual);
+		if (iter->opends_io->streams) {
+			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+				if (!iter->opends_io->streams[i])
+					continue;
+				opends_stream_deregister(iter->opends_io->streams[i]);
+				cudaStreamDestroy(iter->opends_io->streams[i]);
+			}
+			free(iter->opends_io->streams);
+		}
+	}
+	/* Close the driver only after its registered streams are torn down: the
+	 * streams live in the aisio backend's CUDA context, which driver-close
+	 * destroys, so destroying them afterwards faults. */
+	if (iter->type == FIL_OPENDS) {
+		opends_driver_close();
 	}
 	if (iter->data) {
 		free(iter->data->entries);
@@ -524,8 +683,16 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->async && strcmp(opts->backend, "gds") != 0) {
-		fprintf(stderr, "opts->async == true is only compatible with GDS backend");
+	if (opts->async && strcmp(opts->backend, "gds") != 0
+			&& strcmp(opts->backend, "opends") != 0) {
+		fprintf(stderr,
+			"opts->async is only compatible with gds or opends backends\n");
+		return EINVAL;
+	}
+
+	if (strcmp(opts->backend, "opends") == 0 && n_devs != 1) {
+		fprintf(stderr, "opends backend supports a single device only (got %u)\n",
+			n_devs);
 		return EINVAL;
 	}
 
@@ -559,6 +726,12 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return err;
 	}
 
+	if (opts->data_dir[0] == '\0') {
+		fprintf(stderr, "data_dir is required\n");
+		fil_term(_iter);
+		return EINVAL;
+	}
+
 	for (uint32_t i = 0; i < n_devs; i++) {
 		struct fil_dev *device = malloc(sizeof(struct fil_dev));
 		if (!device) {
@@ -575,57 +748,81 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 			fil_term(_iter);
 			return err;
 		}
-		if (_iter->opts->data_dir[0] != '\0') {
-			err = _xal_setup(_iter, device);
-			if (err) {
-				fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
-				xnvme_dev_close(device->dev);
-				fil_term(_iter);
-				return err;
-			}
+		err = _xal_setup(_iter, device);
+		if (err) {
+			fprintf(stderr, "XAL setup failed for %s: %d\n", dev_uris[i], err);
+			xnvme_dev_close(device->dev);
+			fil_term(_iter);
+			return err;
 		}
 		_iter->devs[i] = device;
 		_iter->n_devs++;
 	}
 
-	if (_iter->opts->data_dir[0] != '\0') {
-		err = _alloc(_iter, _iter->opts->batch_size);
-		if (err) {
-			fil_term(_iter);
-			return err;
-		}
-		switch (_iter->type) {
-		case FIL_GPU:
-			_iter->io_fn = fil_gpu_submit;
-			break;
-		case FIL_CPU:
-			_iter->io_fn = fil_cpu_submit;
-			break;
-		case FIL_FILE:
-			if (_iter->opts->async) {
-				_iter->io_fn = fil_gds_async_submit;
-			} else {
-				_iter->io_fn = fil_file_submit;
-			}
-			_find_prefix(_iter);
-			break;
-		}
-
-		// Create an entry for every file in every directory
-		err = _create_entries(_iter);
-		if (err) {
-			fil_term(_iter);
-			return err;
-		}
-
-		FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
-			    uint64_t);
-
-	} else {
-		fprintf(stderr, "data_dir is required\n");
+	_iter->data = calloc(1, sizeof(struct fil_data));
+	if (!_iter->data) {
+		err = errno;
+		fprintf(stderr, "Could not allocate data: %d\n", err);
 		fil_term(_iter);
-		return EINVAL;
+		return err;
 	}
+
+	if (_iter->type == FIL_OPENDS) {
+		/* The upcie-cuda backend DMAs into GPU memory, so a driver-API
+		 * CUDA context must be current before opends_driver_open. */
+		err = _opends_cuda_ctx();
+		if (err) {
+			fil_term(_iter);
+			return err;
+		}
+		opends_error_t derr = opends_driver_open();
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "opends_driver_open: %s\n",
+				opends_op_status_error(derr.err));
+			fil_term(_iter);
+			return derr.err;
+		}
+	}
+
+	// Create an entry for every file in every directory.
+	err = _create_entries(_iter);
+	if (err) {
+		fil_term(_iter);
+		return err;
+	}
+
+	err = _alloc(_iter, _iter->opts->batch_size);
+	if (err) {
+		fil_term(_iter);
+		return err;
+	}
+	switch (_iter->type) {
+	case FIL_GPU:
+		_iter->io_fn = fil_gpu_submit;
+		break;
+	case FIL_CPU:
+		_iter->io_fn = fil_cpu_submit;
+		break;
+	case FIL_FILE:
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_gds_async_submit;
+		} else {
+			_iter->io_fn = fil_file_submit;
+		}
+		_find_prefix(_iter);
+		break;
+	case FIL_OPENDS:
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_opends_async_submit;
+		} else {
+			_iter->io_fn = fil_file_submit;
+		}
+		_find_prefix(_iter);
+		break;
+	}
+
+	FIL_SHUFFLE(_iter->data->entries, struct fil_entry, _iter->data->n_entries,
+		    uint64_t);
 
 	(*iter) = _iter;
 
