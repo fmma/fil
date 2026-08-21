@@ -494,7 +494,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->stream && iter->type == FIL_OPENDS) {
+	if ((iter->opts->stream || iter->opts->async) && iter->type == FIL_OPENDS) {
 		iter->opends_io = calloc(1, sizeof(struct fil_opends_io));
 		if (!iter->opends_io) {
 			err = errno;
@@ -528,6 +528,25 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 			err = errno;
 			fprintf(stderr, "Could not allocate array of actual values: %d\n", err);
 			return err;
+		}
+
+		if (iter->opts->async) {
+			iter->opends_io->bufs =
+				malloc(sizeof(void *) * iter->opts->batch_size);
+			if (!iter->opends_io->bufs) {
+				err = errno;
+				fprintf(stderr, "Could not allocate buffer array: %d\n", err);
+				return err;
+			}
+
+			iter->opends_io->futures =
+				malloc(sizeof(opends_async_future_t) * iter->opts->batch_size);
+			if (!iter->opends_io->futures) {
+				err = errno;
+				fprintf(stderr, "Could not allocate future array: %d\n", err);
+				return err;
+			}
+			return 0;
 		}
 
 		iter->opends_io->streams = calloc(iter->opts->batch_size, sizeof(cudaStream_t));
@@ -620,6 +639,8 @@ fil_term(struct fil_iter *iter)
 		free(iter->opends_io->fds);
 		free(iter->opends_io->expected);
 		free(iter->opends_io->actual);
+		free(iter->opends_io->futures);
+		free(iter->opends_io->bufs);
 		if (iter->opends_io->streams) {
 			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 				if (!iter->opends_io->streams[i])
@@ -687,6 +708,16 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 			&& strcmp(opts->backend, "opends") != 0) {
 		fprintf(stderr,
 			"opts->stream is only compatible with gds or opends backends\n");
+		return EINVAL;
+	}
+
+	if (opts->async && strcmp(opts->backend, "opends") != 0) {
+		fprintf(stderr, "opts->async is only compatible with the opends backend\n");
+		return EINVAL;
+	}
+
+	if (opts->async && opts->stream) {
+		fprintf(stderr, "opts->stream and opts->async are mutually exclusive\n");
 		return EINVAL;
 	}
 
@@ -812,7 +843,9 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		_find_prefix(_iter);
 		break;
 	case FIL_OPENDS:
-		if (_iter->opts->stream) {
+		if (_iter->opts->async) {
+			_iter->io_fn = fil_opends_async_submit;
+		} else if (_iter->opts->stream) {
 			_iter->io_fn = fil_opends_stream_submit;
 		} else {
 			_iter->io_fn = fil_file_submit;
@@ -862,7 +895,8 @@ fil_opts_default()
 				.queue_depth = 1024,
 				.batch_size = 1,
 				.buffered = false,
-				.stream = false};
+				.stream = false,
+				.async = false};
 
 	return opts;
 }

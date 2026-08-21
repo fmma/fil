@@ -40,6 +40,7 @@ struct fil_opts {
 	uint32_t batch_size;  ///< The number of files per batch
 	bool buffered;	      ///< Whether to use O_DIRECT with POSIX
 	bool stream;	      ///< Whether to use the stream-ordered API with GDS or OpenDS
+	bool async;	      ///< Whether to use the async API with OpenDS
 };
 
 /**

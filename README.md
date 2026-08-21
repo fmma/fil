@@ -59,6 +59,7 @@ filperf <device-uri>[,<device-uri>,...] [options]
 | `--gpu-tbsize <n>` | `64` | GPU threadblock size (`aisio-gpu` only) |
 | `--buffered` | off | Disable `O_DIRECT` when using `posix` backend |
 | `--stream` | off | Use the stream-ordered API (`gds` and `opends` backends) |
+| `--async` | off | Use the async API (`opends` backend) |
 | `--summary` | off | Print I/O and dataset statistics after completion |
 | `--help` | | Print usage |
 
