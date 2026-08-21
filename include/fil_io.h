@@ -58,9 +58,9 @@ int
 fil_file_submit(struct fil_iter *iter);
 
 int
-fil_gds_async_submit(struct fil_iter *iter);
+fil_gds_stream_submit(struct fil_iter *iter);
 
 int
-fil_opends_async_submit(struct fil_iter *iter);
+fil_opends_stream_submit(struct fil_iter *iter);
 
 #endif

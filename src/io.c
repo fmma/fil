@@ -339,7 +339,7 @@ fil_file_submit(struct fil_iter *iter)
 			}
 			cuFileHandleDeregister(fh);
 		} else if (is_opends) {
-			bytes_read = opends_read(dfh, buffer, nbytes, 0, 0);
+			bytes_read = opends_sync_read(dfh, buffer, nbytes, 0, 0);
 			opends_handle_deregister(dfh);
 			if (bytes_read < 0) {
 				fprintf(stderr, "Could not read %s, err: %s\n", path,
@@ -387,7 +387,7 @@ fil_file_submit(struct fil_iter *iter)
 }
 
 int
-fil_gds_async_submit(struct fil_iter *iter)
+fil_gds_stream_submit(struct fil_iter *iter)
 {
 	struct fil_entry entry;
 	struct xal_inode dir;
@@ -494,7 +494,7 @@ teardown:
 }
 
 int
-fil_opends_async_submit(struct fil_iter *iter)
+fil_opends_stream_submit(struct fil_iter *iter)
 {
 	struct fil_entry entry;
 	struct xal_inode dir;
@@ -555,10 +555,10 @@ fil_opends_async_submit(struct fil_iter *iter)
 		io->actual[i] = 0;
 		nsub = i + 1;
 
-		derr = opends_read_async(io->handles[i], buffer, &io->expected[i], &offset,
+		derr = opends_stream_read(io->handles[i], buffer, &io->expected[i], &offset,
 					  &offset, &io->actual[i], io->streams[i]);
 		if (derr.err != OPENDS_SUCCESS) {
-			fprintf(stderr, "opends_read_async failed, err: %s\n",
+			fprintf(stderr, "opends_stream_read failed, err: %s\n",
 				opends_op_status_error(derr.err));
 			err = derr.err;
 			goto teardown;

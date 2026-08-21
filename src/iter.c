@@ -441,7 +441,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->async && iter->type == FIL_FILE) {
+	if (iter->opts->stream && iter->type == FIL_FILE) {
 		iter->gds_io = malloc(sizeof(struct fil_gds_io));
 		if (!iter->gds_io) {
 			err = errno;
@@ -494,7 +494,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->async && iter->type == FIL_OPENDS) {
+	if (iter->opts->stream && iter->type == FIL_OPENDS) {
 		iter->opends_io = calloc(1, sizeof(struct fil_opends_io));
 		if (!iter->opends_io) {
 			err = errno;
@@ -683,10 +683,10 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->async && strcmp(opts->backend, "gds") != 0
+	if (opts->stream && strcmp(opts->backend, "gds") != 0
 			&& strcmp(opts->backend, "opends") != 0) {
 		fprintf(stderr,
-			"opts->async is only compatible with gds or opends backends\n");
+			"opts->stream is only compatible with gds or opends backends\n");
 		return EINVAL;
 	}
 
@@ -804,16 +804,16 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		_iter->io_fn = fil_cpu_submit;
 		break;
 	case FIL_FILE:
-		if (_iter->opts->async) {
-			_iter->io_fn = fil_gds_async_submit;
+		if (_iter->opts->stream) {
+			_iter->io_fn = fil_gds_stream_submit;
 		} else {
 			_iter->io_fn = fil_file_submit;
 		}
 		_find_prefix(_iter);
 		break;
 	case FIL_OPENDS:
-		if (_iter->opts->async) {
-			_iter->io_fn = fil_opends_async_submit;
+		if (_iter->opts->stream) {
+			_iter->io_fn = fil_opends_stream_submit;
 		} else {
 			_iter->io_fn = fil_file_submit;
 		}
@@ -862,7 +862,7 @@ fil_opts_default()
 				.queue_depth = 1024,
 				.batch_size = 1,
 				.buffered = false,
-				.async = false};
+				.stream = false};
 
 	return opts;
 }
