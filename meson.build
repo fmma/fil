@@ -1,5 +1,5 @@
 project('fil', 'c', 'cuda',
-  version: '0.3.1',
+  version: '0.3.3',
   meson_version: '>=0.55.0',
   default_options: [
     'c_std=gnu11',
@@ -35,7 +35,12 @@ xnvme_dep = dependency(
 
 xal_dep = dependency(
   'xal',
-  version: '0.3.0',
+  version: '0.3.2',
+  required: true
+)
+
+opends_aisio_dep = dependency(
+  'opends_aisio',
   required: true
 )
 
@@ -44,6 +49,7 @@ fil_deps = [
   cuda_dep,
   xnvme_dep,
   xal_dep,
+  opends_aisio_dep,
 ]
 
 public_headers = files(

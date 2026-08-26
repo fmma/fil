@@ -19,126 +19,68 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <opends.h>
 
-struct _range {
-	uint64_t slba;
-	uint64_t elba;
-	void *dbuf;
-};
+/**
+ * Queue completion callback: reap a finished read, tally any failure into the
+ * error counter passed at queue setup, and release the context. Registered once
+ * per queue in _xnvme_setup.
+ */
+void
+fil_io_cb(struct xnvme_cmd_ctx *ctx, void *cb_arg)
+{
+	uint32_t *errors = cb_arg;
 
-struct _work {
-	uint32_t opc;
-	uint32_t nlb;
-	uint64_t nbytes;
+	if (xnvme_cmd_ctx_cpl_status(ctx)) {
+		xnvme_cmd_ctx_pr(ctx, XNVME_PR_DEF);
+		(*errors)++;
+	}
+	xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
+}
 
-	uint32_t n_ranges;
-	uint32_t cur_range;
-
-	struct _range *ranges;
-	uint32_t errors;
-};
-
+/**
+ * Read a physically-contiguous run of 'nblocks' device blocks starting at
+ * 'slba' into '*dbuf', split into commands of at most 'io_nblocks' blocks (the
+ * configured iosize). Advances '*dbuf' past the bytes read. Completions are
+ * reaped asynchronously by fil_io_cb; when the queue is full 'poke' drains it.
+ */
 static int
-_submit(struct _work *work, struct xnvme_cmd_ctx *ctx)
+_submit_run(struct xnvme_queue *queue, uint32_t nsid, uint64_t slba, uint64_t nblocks,
+	    uint32_t io_nblocks, uint64_t blocksize, void **dbuf)
 {
 	int err;
 
-	ctx->cmd.common.opcode = work->opc;
-	ctx->cmd.common.nsid = xnvme_dev_get_nsid(ctx->dev);
-	if (work->ranges[work->cur_range].slba > work->ranges[work->cur_range].elba) {
-		work->cur_range += 1;
-	}
-	if (work->cur_range >= work->n_ranges) {
-		xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
-		return 0;
-	}
+	while (nblocks) {
+		struct xnvme_cmd_ctx *ctx;
+		uint64_t n = nblocks < io_nblocks ? nblocks : io_nblocks;
+		uint64_t nbytes = n * blocksize;
 
-	ctx->cmd.nvm.slba = work->ranges[work->cur_range].slba;
-	ctx->cmd.nvm.nlb = work->nlb;
-
-retry:
-	err = xnvme_cmd_pass(ctx, work->ranges[work->cur_range].dbuf, work->nbytes, NULL, 0);
-	if (err == -EBUSY || err == -EAGAIN) {
-		xnvme_queue_poke(ctx->async.queue, 0);
-		goto retry;
-	}
-	if (err) {
-		printf("Failed to submit, err: %d\n", err);
-		xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
-		return err;
-	}
-	work->ranges[work->cur_range].slba += (work->nlb + 1);
-	work->ranges[work->cur_range].dbuf =
-		(uint8_t *)work->ranges[work->cur_range].dbuf + work->nbytes;
-	return 0;
-}
-
-static void
-_cb_fn(struct xnvme_cmd_ctx *ctx, void *cb_arg)
-{
-	struct _work *work = cb_arg;
-	if (xnvme_cmd_ctx_cpl_status(ctx)) {
-		xnvme_cmd_ctx_pr(ctx, XNVME_PR_DEF);
-		work->errors++;
-		xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
-		return;
-	}
-
-	if (work->cur_range >= work->n_ranges) {
-		xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
-		return;
-	}
-	_submit(work, ctx);
-}
-
-static int
-_io_range_submit(struct xnvme_queue *queue, uint32_t opc, uint64_t *slbas, uint64_t *elbas,
-		 uint32_t nlb, uint64_t nbytes, void **dbufs, uint32_t n_ranges)
-{
-	struct _work work = {0};
-	struct _range ranges[n_ranges];
-	struct _range *range;
-	uint32_t n_blocks;
-	int err, capacity;
-
-	capacity = xnvme_queue_get_capacity(queue);
-	work.nlb = nlb;
-	work.n_ranges = n_ranges;
-	work.nbytes = nbytes;
-	work.opc = opc;
-	work.ranges = ranges;
-
-	err = xnvme_queue_set_cb(queue, _cb_fn, &work);
-	if (err) {
-		printf("Failed to set queue callback, err: %d\n", err);
-		return err;
-	}
-
-	for (uint32_t i = 0; i < n_ranges; i++) {
-		range = &work.ranges[i];
-		range->slba = slbas[i];
-		range->elba = elbas[i];
-		range->dbuf = dbufs[i];
-		n_blocks = (range->elba - range->slba) + 1;
-		if (n_blocks % (nlb + 1) != 0) {
-			printf("n_blocks (%u) is not divisible by nlb + 1 (%u)\n", n_blocks,
-			       nlb + 1);
-			return -EINVAL;
+		while ((ctx = xnvme_queue_get_cmd_ctx(queue)) == NULL) {
+			xnvme_queue_poke(queue, 0);
 		}
-	}
 
-	for (int i = 0; i < capacity - 1; i++) {
-		struct xnvme_cmd_ctx *ctx = xnvme_queue_get_cmd_ctx(queue);
-		err = _submit(&work, ctx);
+		ctx->cmd.common.opcode = XNVME_SPEC_NVM_OPC_READ;
+		ctx->cmd.common.nsid = nsid;
+		ctx->cmd.nvm.slba = slba;
+		ctx->cmd.nvm.nlb = n - 1;
+
+		do {
+			err = xnvme_cmd_pass(ctx, *dbuf, nbytes, NULL, 0);
+			if (err == -EBUSY || err == -EAGAIN) {
+				xnvme_queue_poke(queue, 0);
+			}
+		} while (err == -EBUSY || err == -EAGAIN);
 		if (err) {
-			break;
+			fprintf(stderr, "Failed to submit, err: %d\n", err);
+			xnvme_queue_put_cmd_ctx(queue, ctx);
+			return err;
 		}
+
+		slba += n;
+		*dbuf = (uint8_t *)*dbuf + nbytes;
+		nblocks -= n;
 	}
-	xnvme_queue_drain(queue);
-	if (work.errors) {
-		return -EIO;
-	}
-	return err;
+	return 0;
 }
 
 /**
@@ -177,64 +119,129 @@ fil_extent_slba(struct fil_dev *device, const struct xal_extent *extent, uint64_
 	return xal_fsbno_offset(device->xal, extent->start_block) / blocksize;
 }
 
+/**
+ * Read a coalesced run and tally the commands it takes into stats. A zero-length
+ * run is a no-op, so the boundary and final flushes in _submit_device can call
+ * this unconditionally.
+ */
+static int
+_flush_run(struct fil_iter *iter, struct fil_dev *device, uint32_t nsid, uint64_t slba,
+	   uint64_t run, uint32_t io_nblocks, uint64_t blocksize, void **dbuf)
+{
+	int err;
+
+	if (!run) {
+		return 0;
+	}
+	err = _submit_run(device->queue, nsid, slba, run, io_nblocks, blocksize, dbuf);
+	if (err) {
+		return err;
+	}
+	iter->stats->io += (run + io_nblocks - 1) / io_nblocks;
+	return 0;
+}
+
+/**
+ * Submit all of a device's per-buffer reads, coalescing physically-adjacent
+ * extents into runs. Always drains the queue before returning -- including on
+ * the error path -- so no outstanding command is left referencing a buffer.
+ */
+static int
+_submit_device(struct fil_iter *iter, struct fil_dev *device, uint32_t dev_id)
+{
+	uint64_t blocksize = xnvme_dev_get_geo(device->dev)->lba_nbytes;
+	uint32_t xal_blksize = xal_get_sb_blocksize(device->xal);
+	uint32_t nsid = xnvme_dev_get_nsid(device->dev);
+	uint32_t io_nblocks;
+	int err = 0;
+
+	if (iter->opts->iosize < blocksize || iter->opts->iosize % blocksize) {
+		fprintf(stderr, "iosize (%lu) must be a multiple of the device LBA size (%lu)\n",
+			iter->opts->iosize, blocksize);
+		return EINVAL;
+	}
+	io_nblocks = iter->opts->iosize / blocksize;
+
+	for (uint32_t j = 0; j < device->n_buffers; j++) {
+		struct xal_inode *file = fil_next_file(iter, device, dev_id, j, NULL);
+		void *dbuf = device->buffers[j];
+		uint64_t slba = 0, run = 0;
+
+		/* Coalesce physically-adjacent extents into a single run and read
+		 * it back in iosize-sized commands; a run is flushed whenever the
+		 * next extent is not contiguous with it. */
+		for (uint32_t k = 0; k < file->content.extents.count; k++) {
+			const struct xal_extent *ext =
+				xal_extent_at(device->xal, file->content.extents.extent_idx + k);
+			uint64_t ext_slba = fil_extent_slba(device, ext, blocksize);
+			uint64_t ext_blocks = (uint64_t)ext->nblocks * xal_blksize / blocksize;
+
+			if (run && ext_slba == slba + run) {
+				run += ext_blocks;
+				continue;
+			}
+			err = _flush_run(iter, device, nsid, slba, run, io_nblocks, blocksize,
+					 &dbuf);
+			if (err) {
+				goto drain;
+			}
+			slba = ext_slba;
+			run = ext_blocks;
+		}
+		err = _flush_run(iter, device, nsid, slba, run, io_nblocks, blocksize, &dbuf);
+		if (err) {
+			goto drain;
+		}
+	}
+
+drain:
+	xnvme_queue_drain(device->queue);
+	return err;
+}
+
+static int
+_copy_buffers_to_gpu(struct fil_iter *iter, struct fil_dev *device, uint32_t dev_id)
+{
+	uint32_t slot;
+	int err;
+
+	for (uint32_t i = 0; i < device->n_buffers; i++) {
+		slot = i + dev_id * device->n_buffers;
+		err = cudaMemcpy(device->gpu_buffers[i], device->buffers[i],
+				 iter->output->buf_len[slot], cudaMemcpyHostToDevice);
+		if (err) {
+			fprintf(stderr, "Could not copy data to GPU memory, err: %d\n", err);
+			return err;
+		}
+	}
+	return 0;
+}
+
 int
 fil_cpu_submit(struct fil_iter *iter)
 {
-	struct xal_inode *dir, *file;
-	struct xal_extent extent, next_extent;
-	uint64_t nblocks, nbytes, blocksize, next_slba;
-	uint32_t xal_blksize, nlb;
 	struct timespec start, end;
 	int err;
 
 	for (uint32_t i = 0; i < iter->n_devs; i++) {
-		clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 		struct fil_dev *device = iter->devs[i];
-		blocksize = xnvme_dev_get_geo(device->dev)->lba_nbytes;
-		xal_blksize = xal_get_sb_blocksize(device->xal);
-		nlb = iter->opts->iosize / blocksize - 1;
 
-		for (uint32_t j = 0; j < device->n_buffers; j++) {
-			file = fil_next_file(iter, device, i, j, &dir);
-			extent = *xal_extent_at(device->xal, file->content.extents.extent_idx);
-			device->cpu_io->slbas[j] = fil_extent_slba(device, &extent, blocksize);
-
-			nbytes = extent.nblocks * xal_blksize;
-			nblocks = nbytes / blocksize;
-
-			for (uint32_t k = 1; k < file->content.extents.count; k++) {
-				next_extent = *xal_extent_at(device->xal,
-							     file->content.extents.extent_idx + k);
-				next_slba = fil_extent_slba(device, &next_extent, blocksize);
-				if (next_slba != device->cpu_io->slbas[j] + nblocks) {
-					fprintf(stderr,
-						"File: %s, in dir: %s, has non contiguous "
-						"extents\n",
-						file->name, dir->name);
-					fprintf(stderr,
-						"extent[%d].elba: %lu, extent[%d].slba: %lu\n",
-						k - 1, device->cpu_io->slbas[j] + nblocks - 1, k,
-						next_slba);
-					return ENOTSUP;
-				}
-				nbytes += next_extent.nblocks * xal_blksize;
-				nblocks = nbytes / blocksize;
-			}
-			device->cpu_io->elbas[j] = device->cpu_io->slbas[j] + nblocks - 1;
-			iter->stats->io += nblocks / (nlb + 1);
-		}
-		clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-		iter->stats->prep_time += ELAPSED(start, end);
-
+		device->io_errors = 0;
 		clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-		err = _io_range_submit(device->queue, XNVME_SPEC_NVM_OPC_READ,
-				       device->cpu_io->slbas, device->cpu_io->elbas, nlb,
-				       iter->opts->iosize, device->buffers, device->n_buffers);
+
+		err = _submit_device(iter, device, i);
+		if (!err && iter->opts->copy_to_gpu) {
+			err = _copy_buffers_to_gpu(iter, device, i);
+		}
+
 		clock_gettime(CLOCK_MONOTONIC_RAW, &end);
 		iter->stats->io_time += ELAPSED(start, end);
 		if (err) {
-			fprintf(stderr, "IO failed: %d\n", err);
 			return err;
+		}
+		if (device->io_errors) {
+			fprintf(stderr, "IO failed: %u\n", device->io_errors);
+			return -EIO;
 		}
 	}
 	return 0;
@@ -364,6 +371,8 @@ fil_file_submit(struct fil_iter *iter)
 	CUfileError_t status;
 	CUfileDescr_t descr;
 	CUfileHandle_t fh;
+	opends_handle_t dfh;
+	opends_error_t derr;
 	uint32_t buf_id, dev_id, xal_blksize;
 	uint64_t nbytes;
 	void *buffer, *bounce;
@@ -371,8 +380,9 @@ fil_file_submit(struct fil_iter *iter)
 	int fd, flags;
 	ssize_t err, bytes_read;
 	bool is_cufile = strcmp(iter->opts->backend, "cufile") == 0;
+	bool is_opends = strcmp(iter->opts->backend, "opends") == 0;
 	flags = O_RDONLY;
-	if (is_cufile || !iter->opts->buffered) {
+	if (is_cufile || is_opends || !iter->opts->buffered) {
 		flags |= O_DIRECT;
 	}
 
@@ -397,7 +407,7 @@ fil_file_submit(struct fil_iter *iter)
 		strcat(path, file->name);
 
 		nbytes = file->size;
-		if (!is_cufile && !iter->opts->buffered) {
+		if (!is_cufile && !is_opends && !iter->opts->buffered) {
 			// POSIX O_DIRECT requires aligned nbytes
 			nbytes = (1 + ((file->size - 1) / xal_blksize)) * xal_blksize;
 		}
@@ -418,6 +428,14 @@ fil_file_submit(struct fil_iter *iter)
 				fprintf(stderr, "Could not register file, err: %d\n", status.err);
 				close(fd);
 				return status.err;
+			}
+		} else if (is_opends) {
+			derr = opends_handle_register(&dfh, fd);
+			if (derr.err != OPENDS_SUCCESS) {
+				fprintf(stderr, "Could not register file, err: %s\n",
+					opends_op_status_error(derr.err));
+				close(fd);
+				return derr.err;
 			}
 		}
 
@@ -442,6 +460,21 @@ fil_file_submit(struct fil_iter *iter)
 				return EIO;
 			}
 			cuFileHandleDeregister(fh);
+		} else if (is_opends) {
+			bytes_read = opends_sync_read(dfh, buffer, nbytes, 0, 0);
+			opends_handle_deregister(dfh);
+			if (bytes_read < 0) {
+				fprintf(stderr, "Could not read %s, err: %s\n", path,
+					opends_op_status_error((opends_op_error_t)(-bytes_read)));
+				return EIO;
+			}
+			if ((uint64_t)bytes_read != nbytes) {
+				fprintf(stderr,
+					"Could not read entire file %s, expected: %lu, actual: "
+					"%ld\n",
+					path, file->size, bytes_read);
+				return EIO;
+			}
 		} else {
 			do {
 				err = read(fd, bounce, nbytes - bytes_read);
@@ -461,11 +494,15 @@ fil_file_submit(struct fil_iter *iter)
 				bytes_read += err;
 			} while ((uint64_t)bytes_read != file->size);
 
-			err = cudaMemcpy(buffer, bounce, file->size, cudaMemcpyHostToDevice);
-			if (err) {
-				fprintf(stderr, "Could not copy data to GPU memory, err: %ld\n",
-					err);
-				return err;
+			if (iter->opts->copy_to_gpu) {
+				err = cudaMemcpy(buffer, bounce, file->size,
+						 cudaMemcpyHostToDevice);
+				if (err) {
+					fprintf(stderr,
+						"Could not copy data to GPU memory, err: %ld\n",
+						err);
+					return err;
+				}
 			}
 		}
 		clock_gettime(CLOCK_MONOTONIC_RAW, &end);
@@ -571,3 +608,99 @@ teardown:
 	}
 	return err;
 }
+
+int
+fil_opends_stream_submit(struct fil_iter *iter)
+{
+	struct xal_inode *dir, *file;
+	struct timespec start, end;
+	struct fil_opends_io *io = iter->opends_io;
+	opends_error_t derr;
+	uint32_t buf_id, dev_id, nsub = 0;
+	void *buffer;
+	char *prefix, *path;
+	off_t offset = 0;
+	int err = 0;
+	int flags = O_RDONLY | O_DIRECT;
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+		dev_id = i % iter->n_devs;
+		struct fil_dev *device = iter->devs[dev_id];
+		buf_id = device->buf++ % device->n_buffers;
+		buffer = device->buffers[buf_id];
+		prefix = device->file_io->prefix;
+		path = device->file_io->path;
+
+		file = fil_next_file(iter, device, dev_id, buf_id, &dir);
+		iter->stats->io++;
+
+		memcpy(path, prefix, strlen(prefix) + 1);
+		strcat(path, "/");
+		strcat(path, dir->name);
+		strcat(path, "/");
+		strcat(path, file->name);
+
+		io->fds[i] = open(path, flags);
+		if (io->fds[i] == -1) {
+			err = errno;
+			fprintf(stderr, "Could not open %s, err: %d\n", path, err);
+			goto teardown;
+		}
+
+		derr = opends_handle_register(&io->handles[i], io->fds[i]);
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "Could not register file, err: %s\n",
+				opends_op_status_error(derr.err));
+			close(io->fds[i]);
+			err = derr.err;
+			goto teardown;
+		}
+
+		io->expected[i] = file->size;
+		io->actual[i] = 0;
+		nsub = i + 1;
+
+		derr = opends_stream_read(io->handles[i], buffer, &io->expected[i], &offset,
+					  &offset, &io->actual[i], io->streams[i]);
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "opends_stream_read failed, err: %s\n",
+				opends_op_status_error(derr.err));
+			err = derr.err;
+			goto teardown;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->prep_time += ELAPSED(start, end);
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+		err = cudaStreamSynchronize(io->streams[i]);
+		if (err) {
+			fprintf(stderr, "Could not synchronize CUDA Stream, err: %d\n", err);
+			goto teardown;
+		}
+		if (io->actual[i] < 0) {
+			fprintf(stderr, "Reading failed, err: %s\n",
+				opends_op_status_error((opends_op_error_t)(-io->actual[i])));
+			err = EIO;
+			goto teardown;
+		}
+		if ((size_t)io->actual[i] != io->expected[i]) {
+			fprintf(stderr, "Could not read entire file, expected: %lu, actual: %ld\n",
+				io->expected[i], io->actual[i]);
+			err = EIO;
+			goto teardown;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->io_time += ELAPSED(start, end);
+
+teardown:
+	for (uint32_t i = 0; i < nsub; i++) {
+		opends_handle_deregister(io->handles[i]);
+		close(io->fds[i]);
+	}
+	return err;
+}
+

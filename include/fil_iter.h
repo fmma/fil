@@ -6,7 +6,7 @@
 #include <fil_io.h>
 #include <stdint.h>
 
-enum fil_type { FIL_GPU, FIL_CPU, FIL_FILE, FIL_P2P };
+enum fil_type { FIL_GPU, FIL_CPU, FIL_FILE, FIL_P2P, FIL_OPENDS };
 
 struct fil_time;
 
@@ -19,10 +19,11 @@ struct fil_dev {
 	struct fil_gpu_io gpu_io;
 	struct xal *xal;
 	struct xal_inode *root_inode;
-	struct fil_cpu_io *cpu_io;
 	struct fil_file_io *file_io;
+	uint32_t io_errors; ///< Reads that failed in the current batch (CPU/P2P path)
 	const char *data_dir;
 	void **buffers;
+	void **gpu_buffers; ///< Per-buffer GPU destinations for the aisio-cpu copy_to_gpu path
 	uint64_t buf;
 	uint32_t n_buffers;
 	uint32_t nsid;
@@ -35,6 +36,7 @@ struct fil_iter {
 	struct fil_opts *opts;
 	struct fil_output *output;
 	struct fil_cufile_io *cufile_io;
+	struct fil_opends_io *opends_io;
 	int (*io_fn)(struct fil_iter *iter);
 	struct fil_time *time;
 	uint64_t buffer_size;
