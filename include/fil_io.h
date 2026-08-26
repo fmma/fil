@@ -38,6 +38,8 @@ struct fil_opends_io {
 	size_t *expected;
 	ssize_t *actual;
 	cudaStream_t *streams;
+	opends_async_future_t *futures;
+	void **bufs;
 };
 
 struct fil_gpu_io {
@@ -72,5 +74,8 @@ fil_cufile_async_submit(struct fil_iter *iter);
 
 int
 fil_opends_stream_submit(struct fil_iter *iter);
+
+int
+fil_opends_async_submit(struct fil_iter *iter);
 
 #endif

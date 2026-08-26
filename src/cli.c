@@ -44,7 +44,7 @@ print_help(const char *name)
 			"the timed run (default = 0)\n");
 	fprintf(stderr, "\t --buffered \t | \t Don't open with O_DIRECT when using POSIX\n");
 	fprintf(stderr, "\t --stream \t | \t Use the stream-ordered API when using OpenDS\n");
-	fprintf(stderr, "\t --async \t | \t Use the async API when using cuFile\n");
+	fprintf(stderr, "\t --async \t | \t Use the async API when using cuFile or OpenDS\n");
 	fprintf(stderr, "\t --register_bufs | \t Register device buffers with cuFileBufRegister "
 			"(cuFile backend)\n");
 	fprintf(stderr, "\t --copy-to-gpu \t | \t Copy each file from host to device memory after "

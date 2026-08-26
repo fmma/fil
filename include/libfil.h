@@ -42,7 +42,7 @@ struct fil_opts {
 	uint32_t batch_size; ///< The number of files per batch
 	bool buffered;       ///< Whether to use O_DIRECT with POSIX
 	bool stream;         ///< Whether to use the stream-ordered API with OpenDS
-	bool async;          ///< Whether to use async API with cuFile
+	bool async;          ///< Whether to use async API with cuFile or OpenDS
 	bool register_bufs;  ///< Register cuFile device buffers with cuFileBufRegister
 	bool copy_to_gpu;    ///< aisio-cpu/posix: copy files host->device after read
 };
