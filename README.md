@@ -62,7 +62,7 @@ filperf <device-uri>[,<device-uri>,...] [options]
 | `--buffered` | off | Disable `O_DIRECT` when using `posix` backend |
 | `--copy-to-gpu` | off | Copy each file from host to device memory after reading (`aisio-cpu` and `posix` only) |
 | `--stream` | off | Use the stream-ordered API (`opends` backend) |
-| `--async` | off | Use async API when using `cufile` backend |
+| `--async` | off | Use async API when using `cufile` or `opends` backend |
 | `--summary` | off | Print I/O and dataset statistics after completion |
 | `--help` | | Print usage |
 

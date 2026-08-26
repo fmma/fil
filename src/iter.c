@@ -632,7 +632,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->async) {
+	if (iter->opts->async && iter->type == FIL_FILE) {
 		iter->cufile_io = malloc(sizeof(struct fil_cufile_io));
 		if (!iter->cufile_io) {
 			err = errno;
@@ -685,7 +685,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->stream) {
+	if ((iter->opts->stream || iter->opts->async) && iter->type == FIL_OPENDS) {
 		iter->opends_io = calloc(1, sizeof(struct fil_opends_io));
 		if (!iter->opends_io) {
 			err = errno;
@@ -722,27 +722,47 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 			return err;
 		}
 
-		iter->opends_io->streams = calloc(iter->opts->batch_size, sizeof(cudaStream_t));
-		if (!iter->opends_io->streams) {
-			err = errno;
-			fprintf(stderr, "Could not allocate array of CUDA Streams: %d\n", err);
-			return err;
-		}
-
-		for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
-			opends_error_t derr;
-
-			err = cudaStreamCreateWithFlags(&iter->opends_io->streams[i],
-							cudaStreamNonBlocking);
-			if (err) {
-				fprintf(stderr, "Could not setup CUDA Stream, err: %d\n", err);
+		if (iter->opts->async) {
+			iter->opends_io->bufs = malloc(sizeof(void *) * iter->opts->batch_size);
+			if (!iter->opends_io->bufs) {
+				err = errno;
+				fprintf(stderr, "Could not allocate array of buffers: %d\n", err);
 				return err;
 			}
-			derr = opends_stream_register(iter->opends_io->streams[i], 0);
-			if (derr.err != OPENDS_SUCCESS) {
-				fprintf(stderr, "opends_stream_register: %s\n",
-					opends_op_status_error(derr.err));
-				return derr.err;
+
+			iter->opends_io->futures =
+				malloc(sizeof(opends_async_future_t) * iter->opts->batch_size);
+			if (!iter->opends_io->futures) {
+				err = errno;
+				fprintf(stderr, "Could not allocate array of futures: %d\n", err);
+				return err;
+			}
+		} else {
+			iter->opends_io->streams =
+				calloc(iter->opts->batch_size, sizeof(cudaStream_t));
+			if (!iter->opends_io->streams) {
+				err = errno;
+				fprintf(stderr, "Could not allocate array of CUDA Streams: %d\n",
+					err);
+				return err;
+			}
+
+			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+				opends_error_t derr;
+
+				err = cudaStreamCreateWithFlags(&iter->opends_io->streams[i],
+								cudaStreamNonBlocking);
+				if (err) {
+					fprintf(stderr, "Could not setup CUDA Stream, err: %d\n",
+						err);
+					return err;
+				}
+				derr = opends_stream_register(iter->opends_io->streams[i], 0);
+				if (derr.err != OPENDS_SUCCESS) {
+					fprintf(stderr, "opends_stream_register: %s\n",
+						opends_op_status_error(derr.err));
+					return derr.err;
+				}
 			}
 		}
 	}
@@ -839,6 +859,8 @@ fil_term(struct fil_iter *iter)
 		free(iter->opends_io->fds);
 		free(iter->opends_io->expected);
 		free(iter->opends_io->actual);
+		free(iter->opends_io->futures);
+		free(iter->opends_io->bufs);
 		if (iter->opends_io->streams) {
 			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 				if (!iter->opends_io->streams[i]) {
@@ -904,13 +926,20 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->async && strcmp(opts->backend, "cufile") != 0) {
-		fprintf(stderr, "opts->async == true is only compatible with cuFile backend");
+	if (opts->async && strcmp(opts->backend, "cufile") != 0 &&
+	    strcmp(opts->backend, "opends") != 0) {
+		fprintf(stderr,
+			"opts->async == true is only compatible with cuFile and OpenDS backends");
 		return EINVAL;
 	}
 
 	if (opts->stream && strcmp(opts->backend, "opends") != 0) {
 		fprintf(stderr, "opts->stream == true is only compatible with OpenDS backend");
+		return EINVAL;
+	}
+
+	if (opts->stream && opts->async) {
+		fprintf(stderr, "opts->stream and opts->async are mutually exclusive");
 		return EINVAL;
 	}
 
@@ -1039,7 +1068,9 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 			_find_prefix(_iter);
 			break;
 		case FIL_OPENDS:
-			if (_iter->opts->stream) {
+			if (_iter->opts->async) {
+				_iter->io_fn = fil_opends_async_submit;
+			} else if (_iter->opts->stream) {
 				_iter->io_fn = fil_opends_stream_submit;
 			} else {
 				_iter->io_fn = fil_file_submit;
