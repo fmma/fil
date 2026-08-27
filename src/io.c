@@ -608,7 +608,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 	struct timespec start, end;
 	struct fil_opends_io *io = iter->opends_io;
 	opends_error_t derr;
-	uint32_t buf_id, dev_id, nreg = 0, next = 0;
+	uint32_t buf_id, dev_id, nreg = 0, nsub = 0;
 	char *prefix, *path;
 	int err = 0;
 	int flags = O_RDONLY | O_DIRECT;
@@ -643,7 +643,7 @@ fil_opends_async_submit(struct fil_iter *iter)
 		if (io->fds[i] == -1) {
 			err = errno;
 			fprintf(stderr, "Could not open %s, err: %d\n", path, err);
-			goto teardown;
+			break;
 		}
 
 		derr = opends_handle_register(&io->handles[i], io->fds[i]);
@@ -652,32 +652,27 @@ fil_opends_async_submit(struct fil_iter *iter)
 				opends_op_status_error(derr.err));
 			close(io->fds[i]);
 			err = derr.err;
-			goto teardown;
+			break;
 		}
 
 		io->expected[i] = file.size;
 		nreg = i + 1;
-	}
-	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
-	iter->stats->prep_time += ELAPSED(start, end);
 
-	/* Submit the whole batch; the backend applies backpressure
-	 * internally. On submit failure stop submitting, but every
-	 * submitted op must still be awaited before the handles can be
-	 * deregistered. */
-	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-	for (; next < iter->opts->batch_size; next++) {
-		derr = opends_async_read(io->handles[next], io->bufs[next], io->expected[next], 0,
-					 0, &io->futures[next]);
+		derr = opends_async_read(io->handles[i], io->bufs[i], io->expected[i], 0, 0,
+					 &io->futures[i]);
 		if (derr.err != OPENDS_SUCCESS) {
 			fprintf(stderr, "opends_async_read failed, err: %s\n",
 				opends_op_status_error(derr.err));
 			err = derr.err;
 			break;
 		}
+		nsub = i + 1;
 	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->prep_time += ELAPSED(start, end);
 
-	for (uint32_t i = 0; i < next; i++) {
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < nsub; i++) {
 		ssize_t n = opends_async_await(&io->futures[i]);
 
 		if (n < 0) {
@@ -694,7 +689,8 @@ fil_opends_async_submit(struct fil_iter *iter)
 	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
 	iter->stats->io_time += ELAPSED(start, end);
 
-teardown:
+	/* Deregister only after the await loop: a handle with I/O in flight on it
+	 * must not be deregistered. */
 	for (uint32_t i = 0; i < nreg; i++) {
 		opends_handle_deregister(io->handles[i]);
 		close(io->fds[i]);
