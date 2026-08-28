@@ -411,7 +411,12 @@ _opends_setup(void)
 		fprintf(stderr, "cuDeviceGet: %d\n", cr);
 		return EIO;
 	}
+	/* CUDA 13 maps cuCtxCreate to the 4-argument _v4 form. */
+#if CUDA_VERSION >= 13000
+	cr = cuCtxCreate(&ctx, NULL, 0, cudev);
+#else
 	cr = cuCtxCreate(&ctx, 0, cudev);
+#endif
 	if (cr != CUDA_SUCCESS) {
 		fprintf(stderr, "cuCtxCreate: %d\n", cr);
 		return EIO;
