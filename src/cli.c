@@ -27,7 +27,7 @@ print_help(const char *name)
 	fprintf(stderr, "\t \t \t | \t The name of the data-dir should be unique\n");
 	fprintf(stderr, "\t --backend \t | \t The backend to use for reading files (aisio-cpu "
 			"[default], aisio-gpu, aisio-p2p, posix, cufile, cufile-stream, opends, "
-			"opends-stream)\n");
+			"opends-stream, opends-async)\n");
 	fprintf(stderr, "\t --mnt \t \t | \t The mountpoint of the drive (default = /mnt). Only "
 			"relevant for backends: 'posix', 'cufile' and 'opends'\n");
 	fprintf(stderr, "\t --iosize \t | \t The number of bytes per I/O (default = 4096). Only "

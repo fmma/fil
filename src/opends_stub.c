@@ -52,3 +52,9 @@ fil_opends_stream_submit(struct fil_iter *FIL_UNUSED(iter))
 {
 	return ENOSYS;
 }
+
+int
+fil_opends_async_submit(struct fil_iter *FIL_UNUSED(iter))
+{
+	return ENOSYS;
+}

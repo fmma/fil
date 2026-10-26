@@ -27,6 +27,8 @@ struct fil_opends_io {
 	size_t *expected;
 	ssize_t *actual;
 	cudaStream_t *streams;
+	opends_async_future_t *futures;
+	void **bufs;
 };
 
 int
@@ -75,7 +77,7 @@ fil_opends_io_alloc(struct fil_iter *iter)
 	struct fil_opends_io *io;
 	int err;
 
-	if (iter->mode != FIL_STREAM) {
+	if (iter->mode == FIL_SYNC) {
 		return 0;
 	}
 
@@ -115,6 +117,24 @@ fil_opends_io_alloc(struct fil_iter *iter)
 		return err;
 	}
 
+	if (iter->mode == FIL_ASYNC) {
+		io->bufs = malloc(sizeof(void *) * iter->opts->batch_size);
+		if (!io->bufs) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of buffers: %d\n", err);
+			return err;
+		}
+
+		io->futures = malloc(sizeof(opends_async_future_t) * iter->opts->batch_size);
+		if (!io->futures) {
+			err = errno;
+			fprintf(stderr, "Could not allocate array of futures: %d\n", err);
+			return err;
+		}
+
+		return 0;
+	}
+
 	io->streams = calloc(iter->opts->batch_size, sizeof(cudaStream_t));
 	if (!io->streams) {
 		err = errno;
@@ -152,6 +172,8 @@ fil_opends_term(struct fil_iter *iter)
 		free(io->fds);
 		free(io->expected);
 		free(io->actual);
+		free(io->futures);
+		free(io->bufs);
 		if (io->streams) {
 			for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
 				if (!io->streams[i]) {
@@ -288,6 +310,94 @@ fil_opends_stream_submit(struct fil_iter *iter)
 
 teardown:
 	for (uint32_t i = 0; i < nsub; i++) {
+		opends_handle_deregister(io->handles[i]);
+		close(io->fds[i]);
+	}
+	return err;
+}
+
+int
+fil_opends_async_submit(struct fil_iter *iter)
+{
+	struct xal_inode *dir, *file;
+	struct timespec start, end;
+	struct fil_opends_io *io = iter->opends_io;
+	opends_error_t derr;
+	uint32_t buf_id, dev_id, nreg = 0, nsub = 0;
+	char *prefix, *path;
+	int err = 0;
+	int flags = O_RDONLY | O_DIRECT;
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < iter->opts->batch_size; i++) {
+		dev_id = i % iter->n_devs;
+		struct fil_dev *device = iter->devs[dev_id];
+		buf_id = device->buf++ % device->n_buffers;
+		io->bufs[i] = device->buffers[buf_id];
+		prefix = device->file_io->prefix;
+		path = device->file_io->path;
+
+		file = fil_next_file(iter, device, dev_id, buf_id, &dir);
+		iter->stats->io++;
+
+		memcpy(path, prefix, strlen(prefix) + 1);
+		strcat(path, "/");
+		strcat(path, dir->name);
+		strcat(path, "/");
+		strcat(path, file->name);
+
+		io->fds[i] = open(path, flags);
+		if (io->fds[i] == -1) {
+			err = errno;
+			fprintf(stderr, "Could not open %s, err: %d\n", path, err);
+			break;
+		}
+
+		derr = opends_handle_register(&io->handles[i], io->fds[i]);
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "Could not register file, err: %s\n",
+				opends_op_status_error(derr.err));
+			close(io->fds[i]);
+			err = derr.err;
+			break;
+		}
+
+		io->expected[i] = file->size;
+		nreg = i + 1;
+
+		derr = opends_async_read(io->handles[i], io->bufs[i], io->expected[i], 0, 0,
+					 &io->futures[i]);
+		if (derr.err != OPENDS_SUCCESS) {
+			fprintf(stderr, "opends_async_read failed, err: %s\n",
+				opends_op_status_error(derr.err));
+			err = derr.err;
+			break;
+		}
+		nsub = i + 1;
+	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->prep_time += ELAPSED(start, end);
+
+	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	for (uint32_t i = 0; i < nsub; i++) {
+		ssize_t n = opends_async_await(&io->futures[i]);
+
+		if (n < 0) {
+			fprintf(stderr, "Reading failed, err: %s\n",
+				opends_op_status_error((opends_op_error_t)-n));
+			err = EIO;
+		} else if ((size_t)n != io->expected[i]) {
+			fprintf(stderr, "Could not read entire file, expected: %lu, actual: %zd\n",
+				io->expected[i], n);
+			err = EIO;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+	iter->stats->io_time += ELAPSED(start, end);
+
+	/* Deregister only after the await loop: a handle with I/O in flight on it
+	 * must not be deregistered. */
+	for (uint32_t i = 0; i < nreg; i++) {
 		opends_handle_deregister(io->handles[i]);
 		close(io->fds[i]);
 	}

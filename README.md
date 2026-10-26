@@ -50,7 +50,7 @@ filperf <device-uri>[,<device-uri>,...] [options]
 | Option | Default | Description |
 |---|---|---|
 | `--data-dir <name>` | _(none)_ | Root directory name containing class subdirectories |
-| `--backend <name>` | `aisio-cpu` | I/O backend: `aisio-cpu`, `aisio-gpu`, `aisio-p2p`, `posix`, `cufile`, `cufile-stream`, `opends`, `opends-stream` |
+| `--backend <name>` | `aisio-cpu` | I/O backend: `aisio-cpu`, `aisio-gpu`, `aisio-p2p`, `posix`, `cufile`, `cufile-stream`, `opends`, `opends-stream`, `opends-async` |
 | `--mnt <path>` | `/mnt` | Mountpoint of the drive (for `posix`, `cufile` and `opends` backends) |
 | `--batch-size <n>` | `1` | Number of files per batch |
 | `--batches <n>` | `1` | Number of batches to read |
@@ -97,7 +97,9 @@ kernel-side GDS driver (`nvidia-fs`); without it, cuFile falls back to a compati
 path that stages through host memory. `opends` reads through the OpenDS aisio file
 API, which resolves extents with xal and submits to NVMe from userspace, so the drive
 must be exported by the OpenDS stack rather than bound to the kernel driver.
-`opends-stream` is the same backend with every read ordered on a CUDA stream.
+`opends-stream` is the same backend with every read ordered on a CUDA stream, and
+`opends-async` submits the whole batch through the OpenDS async API and awaits the
+reads in submission order.
 For these file-level backends, IOPS equals File/s since each file is a single I/O.
 
 ```
