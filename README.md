@@ -9,6 +9,7 @@ workloads, enabling high-throughput data loading for deep learning and HPC use c
 - [xNVMe](https://xnvme.io/) (`next` branch)
 - [xal](https://github.com/xnvme/xal) 0.3.3
 - CUDA (with cuFile)
+- [OpenDS](https://github.com/xnvme/opends) (optional, for the `opends` backends, meson option `opends`)
 
 ## Building
 
@@ -49,8 +50,8 @@ filperf <device-uri>[,<device-uri>,...] [options]
 | Option | Default | Description |
 |---|---|---|
 | `--data-dir <name>` | _(none)_ | Root directory name containing class subdirectories |
-| `--backend <name>` | `aisio-cpu` | I/O backend: `aisio-cpu`, `aisio-gpu`, `aisio-p2p`, `posix`, `cufile`, `cufile-stream` |
-| `--mnt <path>` | `/mnt` | Mountpoint of the drive (for `posix` and `cufile` backends) |
+| `--backend <name>` | `aisio-cpu` | I/O backend: `aisio-cpu`, `aisio-gpu`, `aisio-p2p`, `posix`, `cufile`, `cufile-stream`, `opends`, `opends-stream` |
+| `--mnt <path>` | `/mnt` | Mountpoint of the drive (for `posix`, `cufile` and `opends` backends) |
 | `--batch-size <n>` | `1` | Number of files per batch |
 | `--batches <n>` | `1` | Number of batches to read |
 | `--iosize <n>` | `4096` | Number of bytes per I/O (`aisio-cpu` and `aisio-gpu` only) |
@@ -88,12 +89,15 @@ Dataset stats:
 	Average size of files in the dataset (KiB): 109.862692
 ```
 
-`posix` and `cufile` both require a block device path and the device mounted at `--mnt`.
-`cufile` additionally requires CUDA with the cuFile library, and `cufile-stream` is the
-same backend with every read ordered on a CUDA stream through `cuFileReadAsync`.
-Direct NVMe-to-GPU (GPUDirect Storage) transfers need the kernel-side GDS driver
-(`nvidia-fs`); without it, cuFile falls back to a compatibility path that stages
-through host memory.
+`posix`, `cufile` and `opends` all require a block device path and the device mounted
+at `--mnt`. `cufile` additionally requires CUDA with the cuFile library, and
+`cufile-stream` is the same backend with every read ordered on a CUDA stream through
+`cuFileReadAsync`. Direct NVMe-to-GPU (GPUDirect Storage) transfers need the
+kernel-side GDS driver (`nvidia-fs`); without it, cuFile falls back to a compatibility
+path that stages through host memory. `opends` reads through the OpenDS aisio file
+API, which resolves extents with xal and submits to NVMe from userspace, so the drive
+must be exported by the OpenDS stack rather than bound to the kernel driver.
+`opends-stream` is the same backend with every read ordered on a CUDA stream.
 For these file-level backends, IOPS equals File/s since each file is a single I/O.
 
 ```
