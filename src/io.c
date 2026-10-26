@@ -376,7 +376,7 @@ fil_file_submit(struct fil_iter *iter)
 	char *prefix, *path;
 	int fd, flags;
 	ssize_t err, bytes_read;
-	bool is_cufile = strcmp(iter->opts->backend, "cufile") == 0;
+	bool is_cufile = iter->type == FIL_CUFILE;
 	flags = O_RDONLY;
 	if (is_cufile || !iter->opts->buffered) {
 		flags |= O_DIRECT;
@@ -485,7 +485,7 @@ fil_file_submit(struct fil_iter *iter)
 }
 
 int
-fil_cufile_async_submit(struct fil_iter *iter)
+fil_cufile_stream_submit(struct fil_iter *iter)
 {
 	struct xal_inode *dir, *file;
 	struct timespec start, end;

@@ -94,15 +94,22 @@ _xnvme_setup(struct fil_iter *iter, struct fil_dev *device, const char *uri)
 		iter->type = FIL_FILE;
 	} else if (strcmp(backend, "cufile") == 0) {
 		opts.be = "linux";
-		iter->type = FIL_FILE;
+		iter->type = FIL_CUFILE;
+	} else if (strcmp(backend, "cufile-stream") == 0) {
+		opts.be = "linux";
+		iter->type = FIL_CUFILE;
+		iter->mode = FIL_STREAM;
+	} else {
+		fprintf(stderr, "Invalid backend: %s\n", backend);
+		return EINVAL;
+	}
+
+	if (iter->type == FIL_CUFILE) {
 		status = cuFileDriverOpen();
 		if (status.err != CU_FILE_SUCCESS) {
 			fprintf(stderr, "Could not open cuFile driver: %d\n", status.err);
 			return status.err;
 		}
-	} else {
-		fprintf(stderr, "Invalid backend: %s\n", backend);
-		return EINVAL;
 	}
 
 	dev = xnvme_dev_open(uri, &opts);
@@ -388,7 +395,7 @@ _create_entries(struct fil_iter *iter)
 static bool
 _file_buffers_on_device(struct fil_iter *iter)
 {
-	return (strcmp(iter->opts->backend, "cufile") == 0) || iter->opts->copy_to_gpu;
+	return iter->type == FIL_CUFILE || iter->opts->copy_to_gpu;
 }
 
 static int
@@ -465,6 +472,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 				}
 				break;
 			case FIL_FILE:
+			case FIL_CUFILE:
 				if (!_file_buffers_on_device(iter)) {
 					// Aligned, as the reads are O_DIRECT unless buffered
 					err = posix_memalign(&device->buffers[j],
@@ -484,8 +492,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 						err);
 					return err;
 				}
-				if (strcmp(iter->opts->backend, "cufile") == 0 &&
-				    iter->opts->register_bufs) {
+				if (iter->type == FIL_CUFILE && iter->opts->register_bufs) {
 					CUfileError_t fstatus = cuFileBufRegister(
 						device->buffers[j], iter->buffer_size, 0);
 					if (fstatus.err != CU_FILE_SUCCESS) {
@@ -511,7 +518,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 			}
 		}
 
-		if (iter->type == FIL_FILE) {
+		if (iter->type == FIL_FILE || iter->type == FIL_CUFILE) {
 			device->file_io = malloc(sizeof(struct fil_file_io));
 			if (!device->file_io) {
 				err = errno;
@@ -591,7 +598,7 @@ _alloc(struct fil_iter *iter, uint32_t n_buffers)
 		}
 	}
 
-	if (iter->opts->async) {
+	if (iter->mode == FIL_STREAM) {
 		iter->cufile_io = malloc(sizeof(struct fil_cufile_io));
 		if (!iter->cufile_io) {
 			err = errno;
@@ -694,13 +701,13 @@ fil_term(struct fil_iter *iter)
 			xnvme_queue_term(device->queue);
 			break;
 		case FIL_FILE:
+		case FIL_CUFILE:
 			for (uint32_t j = 0; j < device->n_buffers; j++) {
 				if (!_file_buffers_on_device(iter)) {
 					free(device->buffers[j]);
 					continue;
 				}
-				if (strcmp(iter->opts->backend, "cufile") == 0 &&
-				    iter->opts->register_bufs) {
+				if (iter->type == FIL_CUFILE && iter->opts->register_bufs) {
 					cuFileBufDeregister(device->buffers[j]);
 				}
 				cudaFree(device->buffers[j]);
@@ -774,12 +781,8 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->async && strcmp(opts->backend, "cufile") != 0) {
-		fprintf(stderr, "opts->async == true is only compatible with cuFile backend");
-		return EINVAL;
-	}
-
-	if (opts->register_bufs && strcmp(opts->backend, "cufile") != 0) {
+	if (opts->register_bufs && strcmp(opts->backend, "cufile") != 0 &&
+	    strcmp(opts->backend, "cufile-stream") != 0) {
 		fprintf(stderr,
 			"opts->register_bufs == true is only compatible with cuFile backend");
 		return EINVAL;
@@ -882,8 +885,9 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 			_iter->io_fn = fil_cpu_submit;
 			break;
 		case FIL_FILE:
-			if (_iter->opts->async) {
-				_iter->io_fn = fil_cufile_async_submit;
+		case FIL_CUFILE:
+			if (_iter->mode == FIL_STREAM) {
+				_iter->io_fn = fil_cufile_stream_submit;
 			} else {
 				_iter->io_fn = fil_file_submit;
 			}
@@ -946,7 +950,6 @@ fil_opts_default()
 				.max_file_size = 0,
 				.batch_size = 1,
 				.buffered = false,
-				.async = false,
 				.register_bufs = false,
 				.copy_to_gpu = false};
 

@@ -49,7 +49,7 @@ filperf <device-uri>[,<device-uri>,...] [options]
 | Option | Default | Description |
 |---|---|---|
 | `--data-dir <name>` | _(none)_ | Root directory name containing class subdirectories |
-| `--backend <name>` | `aisio-cpu` | I/O backend: `aisio-cpu`, `aisio-gpu`, `aisio-p2p`, `posix`, `cufile` |
+| `--backend <name>` | `aisio-cpu` | I/O backend: `aisio-cpu`, `aisio-gpu`, `aisio-p2p`, `posix`, `cufile`, `cufile-stream` |
 | `--mnt <path>` | `/mnt` | Mountpoint of the drive (for `posix` and `cufile` backends) |
 | `--batch-size <n>` | `1` | Number of files per batch |
 | `--batches <n>` | `1` | Number of batches to read |
@@ -60,7 +60,6 @@ filperf <device-uri>[,<device-uri>,...] [options]
 | `--warmup <n>` | `0` | Un-timed batches to run before starting the measurement window |
 | `--buffered` | off | Disable `O_DIRECT` when using `posix` backend |
 | `--copy-to-gpu` | off | Copy each file from host to device memory after reading (`aisio-cpu` and `posix` only) |
-| `--async` | off | Use async API when using `cufile` backend |
 | `--summary` | off | Print I/O and dataset statistics after completion |
 | `--help` | | Print usage |
 
@@ -90,9 +89,11 @@ Dataset stats:
 ```
 
 `posix` and `cufile` both require a block device path and the device mounted at `--mnt`.
-`cufile` additionally requires CUDA with the cuFile library. Direct NVMe-to-GPU
-(GPUDirect Storage) transfers need the kernel-side GDS driver (`nvidia-fs`); without
-it, cuFile falls back to a compatibility path that stages through host memory.
+`cufile` additionally requires CUDA with the cuFile library, and `cufile-stream` is the
+same backend with every read ordered on a CUDA stream through `cuFileReadAsync`.
+Direct NVMe-to-GPU (GPUDirect Storage) transfers need the kernel-side GDS driver
+(`nvidia-fs`); without it, cuFile falls back to a compatibility path that stages
+through host memory.
 For these file-level backends, IOPS equals File/s since each file is a single I/O.
 
 ```
