@@ -540,6 +540,12 @@ _list_dataset(struct fil_dev *device, struct fil_stats *stats)
 	return err;
 }
 
+static bool
+_uses_index(const struct fil_opts *opts)
+{
+	return strncmp(opts->backend, "aisio-", strlen("aisio-")) == 0;
+}
+
 static int
 _dataset_setup(struct fil_iter *iter, struct fil_dev *device)
 {
@@ -552,10 +558,12 @@ _dataset_setup(struct fil_iter *iter, struct fil_dev *device)
 		return errno;
 	}
 
-	if (iter->opts->xal_shm[0] == '\0') {
-		err = _list_dataset(device, &stats);
-	} else {
+	/* The aisio backends take the extents from the index; every other backend
+	 * reads through a file descriptor and needs no index to find the files. */
+	if (_uses_index(iter->opts)) {
 		err = _read_index(iter, device, &stats);
+	} else {
+		err = _list_dataset(device, &stats);
 	}
 	if (!err && !device->n_files) {
 		fprintf(stderr, "No files in %s\n", device->data_dir);
@@ -1118,8 +1126,8 @@ fil_init(struct fil_iter **iter, char **dev_uris, uint32_t n_devs, struct fil_op
 		return EINVAL;
 	}
 
-	if (opts->xal_shm[0] == '\0' && _uses_homi(opts)) {
-		fprintf(stderr, "xal_shm is required for the aisio and opends backends\n");
+	if (opts->xal_shm[0] == '\0' && _uses_index(opts)) {
+		fprintf(stderr, "xal_shm is required for the aisio backends\n");
 		return EINVAL;
 	}
 
